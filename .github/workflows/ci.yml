@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  health-check-desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            curl wget file \
+            libssl-dev \
+            libxdo-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            xvfb
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build debug binary
+        run: cargo build --manifest-path src-tauri/Cargo.toml
+
+      - name: Smoke test (Linux) - app launches and stays alive
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          xvfb-run -a bash -c '
+            ./src-tauri/target/debug/tauri-app &
+            PID=$!
+            sleep 5
+            if kill -0 $PID 2>/dev/null; then
+              echo "OK: app still running after 5s"
+              kill $PID
+              exit 0
+            else
+              wait $PID
+              CODE=$?
+              echo "FAIL: app exited early with code $CODE"
+              exit 1
+            fi
+          '
+
+      - name: Smoke test (macOS) - app launches and stays alive
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          ./src-tauri/target/debug/tauri-app &
+          PID=$!
+          sleep 5
+          if kill -0 $PID 2>/dev/null; then
+            echo "OK: app still running after 5s"
+            kill $PID
+          else
+            wait $PID
+            CODE=$?
+            echo "FAIL: app exited early with code $CODE"
+            exit 1
+          fi
+
+      - name: Smoke test (Windows) - app launches and stays alive
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath "src-tauri/target/debug/tauri-app.exe" -PassThru
+          Start-Sleep -Seconds 5
+          if (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) {
+            Write-Output "OK: app still running after 5s"
+            Stop-Process -Id $proc.Id -Force
+          } else {
+            Write-Output "FAIL: app exited early"
+            exit 1
+          }
+
+  health-check-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # Only the x86_64 target is needed here: the emulator used for the
+      # smoke test below runs x86_64, and building the other 3 ABIs would
+      # just waste CI time without adding to the health signal.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK and platform tools
+        run: sdkmanager --install "ndk;28.2.13676358" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Set NDK_HOME
+        run: echo "NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - run: npm ci
+
+      - name: Build debug APK (x86_64 only)
+        run: npm run tauri android build -- --debug --apk --target x86_64-linux-android
+
+      - name: Locate built APK
+        id: apk
+        run: |
+          APK=$(find src-tauri/gen/android -name "*-debug.apk" | head -n 1)
+          echo "Found $APK"
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Boot emulator and verify app launches
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: |
+            adb install -r "${{ steps.apk.outputs.path }}"
+            adb shell monkey -p com.tuhlopuz.sonic -c android.intent.category.LAUNCHER 1
+            sleep 8
+            PID=$(adb shell pidof com.tuhlopuz.sonic | tr -d '\r')
+            if [ -z "$PID" ]; then
+              echo "FAIL: app is not running on emulator"
+              adb logcat -d | tail -n 200
+              exit 1
+            fi
+            echo "OK: app running with pid $PID"
