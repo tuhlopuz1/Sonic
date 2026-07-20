@@ -144,7 +144,7 @@ jobs:
       - run: npm ci
 
       - name: Build debug APK (x86_64 only)
-        run: npm run tauri android build -- --debug --apk --target x86_64-linux-android
+        run: npm run tauri android build -- --debug --apk --target x86_64
 
       - name: Locate built APK
         id: apk
