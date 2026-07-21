@@ -95,6 +95,209 @@ button {
   margin-right: 5px;
 }
 
+.channel-check {
+  margin: 2em auto 0;
+  max-width: 480px;
+  padding: 1.2em 1.5em 1.5em;
+  border-radius: 12px;
+  background-color: #ffffffb0;
+  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.1);
+  text-align: left;
+}
+
+.channel-check h2 {
+  margin: 0 0 0.3em;
+  font-size: 1.1em;
+  text-align: center;
+}
+
+.channel-check-hint {
+  margin: 0 0 1em;
+  font-size: 0.85em;
+  opacity: 0.75;
+  text-align: center;
+}
+
+#check-channel-btn {
+  display: block;
+  width: 100%;
+}
+
+.channel-status {
+  min-height: 1.4em;
+  margin: 0.7em 0 0;
+  font-size: 0.9em;
+  text-align: center;
+  opacity: 0.85;
+}
+
+.channel-result:empty {
+  margin: 0;
+}
+
+.channel-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6em;
+  margin-top: 0.9em;
+}
+
+.metric {
+  flex: 1 1 120px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15em;
+  padding: 0.5em 0.7em;
+  border-radius: 8px;
+  background-color: #0000000d;
+}
+
+.metric-label {
+  font-size: 0.75em;
+  opacity: 0.7;
+}
+
+.metric-value {
+  font-size: 1.05em;
+  font-weight: 600;
+}
+
+.mode-badge {
+  margin-top: 0.9em;
+  padding: 0.7em 0.9em;
+  border-radius: 10px;
+  border-left: 6px solid #396cd8;
+  background-color: #396cd81a;
+}
+
+.mode-badge.mode-css {
+  border-left-color: #396cd8;
+  background-color: #396cd81a;
+}
+
+.mode-badge.mode-qpsk {
+  border-left-color: #24c8db;
+  background-color: #24c8db1a;
+}
+
+.mode-badge.mode-16qam {
+  border-left-color: #e8912d;
+  background-color: #e8912d1a;
+}
+
+.mode-badge.mode-64qam {
+  border-left-color: #2ecc71;
+  background-color: #2ecc711a;
+}
+
+.mode-name {
+  font-weight: 600;
+}
+
+.mode-rate {
+  font-size: 0.85em;
+  opacity: 0.75;
+}
+
+.tone-bars {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 0.3em;
+  height: 90px;
+  margin-top: 1em;
+}
+
+.tone-bar {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  height: 100%;
+}
+
+.tone-bar-track {
+  flex: 1;
+  width: 100%;
+  display: flex;
+  align-items: flex-end;
+  border-radius: 4px;
+  background-color: #0000000d;
+  overflow: hidden;
+}
+
+.tone-bar-fill {
+  width: 100%;
+  border-radius: 4px 4px 0 0;
+  background-color: #396cd8;
+  transition: height 0.3s ease;
+}
+
+.tone-freq {
+  margin-top: 0.3em;
+  font-size: 0.65em;
+  opacity: 0.65;
+}
+
+.channel-check-wide {
+  max-width: 820px;
+}
+
+.row-2p {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6em;
+}
+
+#nickname-input {
+  min-width: 180px;
+  text-transform: uppercase;
+}
+
+.discovery-list {
+  list-style: none;
+  margin: 1em 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5em;
+}
+
+.discovery-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.7em;
+  padding: 0.6em 0.8em;
+  border-radius: 8px;
+  background-color: #0000000d;
+}
+
+.discovery-nickname {
+  font-weight: 700;
+  min-width: 5em;
+}
+
+.discovery-snr {
+  font-size: 0.85em;
+  opacity: 0.8;
+  flex: 1;
+}
+
+.mode-badge.inline {
+  margin-top: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 0.5em;
+  padding: 0.3em 0.6em;
+}
+
+.mode-badge.inline .mode-rate {
+  font-size: 0.75em;
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     color: #f6f6f6;
@@ -112,5 +315,15 @@ button {
   }
   button:active {
     background-color: #0f0f0f69;
+  }
+
+  .channel-check {
+    background-color: #0f0f0f66;
+  }
+
+  .metric,
+  .tone-bar-track,
+  .discovery-item {
+    background-color: #ffffff14;
   }
 }

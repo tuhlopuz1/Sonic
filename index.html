@@ -38,6 +38,33 @@
         <button type="submit">Greet</button>
       </form>
       <p id="greet-msg"></p>
+
+      <section class="channel-check">
+        <h2>Проверка канала (это устройство)</h2>
+        <p class="channel-check-hint">
+          На ~2 секунды нужна тишина, затем колонки проиграют короткий тестовый сигнал —
+          не закрывайте микрофон.
+        </p>
+        <button id="check-channel-btn" type="button">Проверить канал</button>
+        <p id="channel-status" class="channel-status"></p>
+        <div id="channel-result" class="channel-result"></div>
+      </section>
+
+      <section class="channel-check channel-check-wide">
+        <h2>Обнаружение устройств (по звуку)</h2>
+        <p class="channel-check-hint">
+          Без Wi-Fi/сети — устройство слушает и проигрывает свой никнейм через динамик.
+          Запустите на нескольких устройствах рядом друг с другом (ПК↔ПК, телефон↔телефон,
+          ПК↔телефон) — каждое услышанное устройство появится в списке ниже вместе с
+          качеством приёма (~20 c на весь поиск).
+        </p>
+        <div class="row-2p">
+          <input id="nickname-input" placeholder="Ваш никнейм, напр. ALEX-PC" maxlength="6" />
+          <button id="discover-btn" type="button">Найти устройства</button>
+        </div>
+        <p id="discovery-status" class="channel-status"></p>
+        <ul id="discovery-list" class="discovery-list"></ul>
+      </section>
     </main>
   </body>
 </html>
