@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     branches: [master]
+  workflow_dispatch:
 
 concurrency:
   group: release
@@ -13,7 +14,9 @@ permissions:
 
 jobs:
   prepare:
-    if: contains(github.event.head_commit.message, '[release]')
+    # Push events still need "[release]" in the commit message; a manual "Run workflow"
+    # click from the Actions tab is already an explicit request, no tag needed for that.
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[release]')
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
