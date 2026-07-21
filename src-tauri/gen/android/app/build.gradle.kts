@@ -15,8 +15,10 @@ val tauriProperties = Properties().apply {
 
 // Release signing: populated from a `keystore.properties` at the Android project root —
 // either created locally by a developer (gitignored) or written out from CI secrets right
-// before this build runs (see .github/workflows/release.yml). Without it, the release
-// build type is simply left unsigned (still builds, just not installable as-is).
+// before this build runs (see .github/workflows/release.yml). Without it, release falls
+// back to signing with the auto-generated debug key further down — still just as
+// installable as before, just not upgradable in place once real secrets are added later
+// (Android treats a differently-signed APK as a different app).
 val keystorePropertiesFile = rootProject.file("keystore.properties")
 val keystoreProperties = Properties().apply {
     if (keystorePropertiesFile.exists()) {
@@ -59,8 +61,10 @@ android {
         }
         getByName("release") {
             isMinifyEnabled = true
-            if (keystorePropertiesFile.exists()) {
-                signingConfig = signingConfigs.getByName("release")
+            signingConfig = if (keystorePropertiesFile.exists()) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
             }
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }
