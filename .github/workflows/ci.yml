@@ -166,10 +166,4 @@ jobs:
             adb install -r "${{ steps.apk.outputs.path }}"
             adb shell monkey -p com.tuhlopuz.sonic -c android.intent.category.LAUNCHER 1
             sleep 8
-            PID=$(adb shell pidof com.tuhlopuz.sonic | tr -d '\r')
-            if [ -z "$PID" ]; then
-              echo "FAIL: app is not running on emulator"
-              adb logcat -d | tail -n 200
-              exit 1
-            fi
-            echo "OK: app running with pid $PID"
+            PID=$(adb shell pidof com.tuhlopuz.sonic | tr -d '\r'); if [ -z "$PID" ]; then echo "FAIL: app is not running on emulator"; adb logcat -d | tail -n 200; exit 1; fi; echo "OK: app running with pid $PID"
