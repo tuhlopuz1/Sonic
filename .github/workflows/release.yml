@@ -18,22 +18,46 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Read version from tauri.conf.json
+      # If src-tauri/tauri.conf.json's version is already tagged (forgot to bump it
+      # before pushing with [release]), auto-bump the patch number until we find one
+      # that isn't tagged yet, and commit that bump back to master ourselves — so
+      # a forgotten bump never blocks the release, only delays it by one patch.
+      - name: Auto-bump version if already released
         id: version
         run: |
-          VERSION=$(jq -r .version src-tauri/tauri.conf.json)
+          set -euo pipefail
+          CURRENT=$(jq -r .version src-tauri/tauri.conf.json)
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          VERSION="$CURRENT"
+          while git ls-remote --tags origin | grep -q "refs/tags/v${VERSION}$"; do
+            PATCH=$((PATCH + 1))
+            VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          done
+
+          if [ "$VERSION" != "$CURRENT" ]; then
+            echo "v$CURRENT is already released, bumping to v$VERSION"
+            for FILE in package.json src-tauri/tauri.conf.json; do
+              jq --arg v "$VERSION" '.version = $v' "$FILE" > "$FILE.tmp"
+              mv "$FILE.tmp" "$FILE"
+            done
+            sed -i "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
+            git commit -m "chore: bump version to $VERSION (auto, previous version already released)"
+            git push origin HEAD:master
+          fi
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Fail if this tag was already released
-        run: |
-          if git ls-remote --tags origin | grep -q "refs/tags/v${{ steps.version.outputs.version }}$"; then
-            echo "Tag v${{ steps.version.outputs.version }} already exists. Bump the version in src-tauri/tauri.conf.json (and package.json) before pushing with [release]."
-            exit 1
-          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build-desktop:
     needs: prepare
@@ -44,6 +68,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
 
       - name: Install Linux system dependencies
         if: matrix.os == 'ubuntu-latest'
@@ -96,6 +122,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
 
       - uses: actions/setup-node@v4
         with:
@@ -125,11 +153,36 @@ jobs:
 
       - run: npm ci
 
-      # No signing keystore is configured yet, so this ships a debug-signed
-      # APK (installable for testing/demo, not a Play Store release build).
-      # Swap to `--debug` removed + keystore secrets once real signing is set up.
-      - name: Build debug APK (all ABIs)
-        run: npm run tauri android build -- --debug --apk
+      # Populates src-tauri/gen/android/keystore.properties (gitignored) from repo
+      # secrets, which app/build.gradle.kts picks up automatically for release
+      # signing. If the secret isn't set yet, this is skipped and Gradle just
+      # produces an unsigned release APK instead of failing the build.
+      - name: Set up release signing keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "No ANDROID_KEYSTORE_BASE64 secret set — building an unsigned release APK."
+            exit 0
+          fi
+          KEYSTORE_PATH="$GITHUB_WORKSPACE/src-tauri/gen/android/release.keystore"
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_PATH"
+          cat > src-tauri/gen/android/keystore.properties <<EOF
+          storeFile=$KEYSTORE_PATH
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEY_PASSWORD
+          EOF
+
+      # Real release build (optimized, R8-minified, stripped native libs) instead of
+      # debug, split per ABI instead of one universal APK bundling all 4 architectures
+      # into a single file — that combination was making release downloads ~500MB for
+      # something most phones only need about an eighth of.
+      - name: Build release APKs (split per ABI)
+        run: npm run tauri android build -- --split-per-abi --apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -143,6 +196,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
 
       - uses: actions/download-artifact@v4
         with:
