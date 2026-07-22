@@ -4,7 +4,7 @@
 # живут в корневом [workspace.package].
 [package]
 name = "tauri-app"
-version = "0.2.5"
+version = "0.2.6"
 description = "Sonic — full-duplex акустический мессенджер"
 authors = ["tuhlopuz"]
 edition = "2021"
