@@ -32,6 +32,12 @@ interface LinkQuality {
 interface SessionStateChanged {
   state: "up" | "down";
 }
+interface AudioDevices {
+  inputs: string[];
+  outputs: string[];
+  default_input: string | null;
+  default_output: string | null;
+}
 
 let selectedRole: Role = "initiator";
 let selectedProfile: Profile = "audible";
@@ -55,6 +61,80 @@ function wireSegmented(containerSel: string, onPick: (value: string) => void) {
   });
 }
 
+// ── Выбор аудио-устройств ────────────────────────────────────────────────────
+
+const INPUT_DEVICE_KEY = "sonic-input-device";
+const OUTPUT_DEVICE_KEY = "sonic-output-device";
+
+/// Заполняет <select> списком устройств. Пустое значение = системное по умолчанию.
+///
+/// Живой выбор пользователя важнее запомненного; в localStorage при перерисовке НЕ
+/// пишем — иначе временно выдернутое устройство забылось бы навсегда, а так оно
+/// автоматически выберется снова, когда его воткнут обратно.
+function fillDeviceSelect(
+  select: HTMLSelectElement | null,
+  devices: string[],
+  systemDefault: string | null,
+  storageKey: string
+) {
+  if (!select) return;
+  const wanted = select.value || localStorage.getItem(storageKey) || "";
+  const defaultLabel = systemDefault
+    ? `Системный по умолчанию — ${systemDefault}`
+    : "Системный по умолчанию";
+
+  select.innerHTML =
+    `<option value="">${defaultLabel}</option>` +
+    devices.map((d) => `<option value="${d}">${d}</option>`).join("");
+
+  select.value = devices.includes(wanted) ? wanted : "";
+}
+
+function renderDevices(devices: AudioDevices) {
+  fillDeviceSelect(
+    $<HTMLSelectElement>("#input-device"),
+    devices.inputs,
+    devices.default_input,
+    INPUT_DEVICE_KEY
+  );
+  fillDeviceSelect(
+    $<HTMLSelectElement>("#output-device"),
+    devices.outputs,
+    devices.default_output,
+    OUTPUT_DEVICE_KEY
+  );
+  updateToolsDevicesHint();
+}
+
+async function loadDevices() {
+  const errorEl = $("#setup-error");
+  try {
+    renderDevices(await invoke<AudioDevices>("list_audio_devices"));
+  } catch (err) {
+    if (errorEl) errorEl.textContent = `Не удалось получить список устройств: ${err}`;
+  }
+}
+
+/// Текущий выбор устройств — им пользуются и сессия, и инструменты канала.
+function currentDevices(): { inputDevice: string; outputDevice: string } {
+  return {
+    inputDevice: $<HTMLSelectElement>("#input-device")?.value ?? "",
+    outputDevice: $<HTMLSelectElement>("#output-device")?.value ?? "",
+  };
+}
+
+/// Показывает в блоке инструментов, какие устройства реально будут использованы —
+/// иначе непонятно, почему зонд «не звучит» (например, вывод ушёл на гарнитуру).
+function updateToolsDevicesHint() {
+  const hint = $("#tools-devices");
+  if (!hint) return;
+  const label = (sel: string) => {
+    const el = $<HTMLSelectElement>(sel);
+    return el?.selectedOptions[0]?.text ?? "—";
+  };
+  hint.textContent = `Используются: 🎤 ${label("#input-device")} → 🔊 ${label("#output-device")}`;
+}
+
 // ── Сессия ──────────────────────────────────────────────────────────────────
 
 async function startSession() {
@@ -63,7 +143,11 @@ async function startSession() {
   if (errorEl) errorEl.textContent = "";
   if (startBtn) startBtn.disabled = true;
   try {
-    await invoke("start_session", { profile: selectedProfile, role: selectedRole });
+    await invoke("start_session", {
+      profile: selectedProfile,
+      role: selectedRole,
+      ...currentDevices(),
+    });
     // Дальше UI переключит session-state-changed → "up".
   } catch (err) {
     if (errorEl) errorEl.textContent = `Ошибка запуска: ${err}`;
@@ -183,6 +267,20 @@ function wireMessenger() {
   $("#start-btn")?.addEventListener("click", startSession);
   $("#stop-btn")?.addEventListener("click", stopSession);
   $("#composer")?.addEventListener("submit", sendMessage);
+  $("#refresh-devices")?.addEventListener("click", loadDevices);
+
+  // Запоминаем выбор устройств между запусками и держим подсказку в актуальном виде.
+  $<HTMLSelectElement>("#input-device")?.addEventListener("change", (e) => {
+    localStorage.setItem(INPUT_DEVICE_KEY, (e.target as HTMLSelectElement).value);
+    updateToolsDevicesHint();
+  });
+  $<HTMLSelectElement>("#output-device")?.addEventListener("change", (e) => {
+    localStorage.setItem(OUTPUT_DEVICE_KEY, (e.target as HTMLSelectElement).value);
+    updateToolsDevicesHint();
+  });
+  // Hot-plug: бэкенд следит за списком и присылает событие только при реальном изменении.
+  listen<AudioDevices>("audio-devices-changed", (e) => renderDevices(e.payload));
+  loadDevices();
 
   listen<MessageReceived>("message-received", (e) => {
     appendBubble(e.payload.text, "in");
@@ -297,7 +395,7 @@ async function checkChannel() {
   resultEl.innerHTML = "";
   statusEl.textContent = "Проверка: тишина, затем тестовый сигнал (~2 c)…";
   try {
-    const report = await invoke<ChannelReport>("check_channel");
+    const report = await invoke<ChannelReport>("check_channel", currentDevices());
     statusEl.textContent = "Готово";
     resultEl.innerHTML = channelReportHtml(report);
   } catch (err) {
@@ -352,7 +450,7 @@ async function discoverDevices() {
   setDiscoveryBusy(true);
   statusEl.textContent = "Слушаем и проигрываем маячок (~20 c)…";
   try {
-    await invoke("discover_devices", { nickname });
+    await invoke("discover_devices", { nickname, ...currentDevices() });
   } catch (err) {
     statusEl.textContent = `Ошибка: ${err}`;
     setDiscoveryBusy(false);

@@ -1,9 +1,9 @@
 //! Команды Tauri для мессенджера (PROTOCOL.md §11.3): старт/стоп сессии, отправка
 //! сообщения, выбор режима, список аудио-устройств. Заменяют demo-`greet`.
 
+use crate::channel_check::AudioSelection;
 use crate::session::{ModePolicy, SessionHandle};
 use crate::state::AppState;
-use serde::Serialize;
 use sonic_protocol::{Profile, Role};
 use tauri::State;
 
@@ -33,21 +33,32 @@ fn parse_mode(s: &str) -> Result<ModePolicy, String> {
 }
 
 /// Запускает сессию мессенджера: открывает дуплексный аудио-движок и поток MAC/ARQ.
+/// `input_device`/`output_device` — имена устройств из `list_audio_devices`;
+/// пусто/отсутствует — системные по умолчанию.
 #[tauri::command]
 pub fn start_session(
     app: tauri::AppHandle,
     state: State<AppState>,
     profile: String,
     role: String,
+    input_device: Option<String>,
+    output_device: Option<String>,
 ) -> Result<(), String> {
     let profile = parse_profile(&profile)?;
     let role = parse_role(&role)?;
+    let clean = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
 
     let mut guard = state.session.lock().map_err(|_| "state poisoned")?;
     if guard.is_some() {
         return Err("Сессия уже запущена".into());
     }
-    let handle = SessionHandle::start(app, profile, role)?;
+    let handle = SessionHandle::start(
+        app,
+        profile,
+        role,
+        clean(input_device),
+        clean(output_device),
+    )?;
     *guard = Some(handle);
     Ok(())
 }
@@ -81,22 +92,37 @@ pub fn set_mode(state: State<AppState>, mode: String) -> Result<(), String> {
     }
 }
 
-#[derive(Serialize)]
-pub struct AudioDevices {
-    inputs: Vec<String>,
-    outputs: Vec<String>,
-    default_input: Option<String>,
-    default_output: Option<String>,
+/// Список аудио-устройств для UI (первичное заполнение; дальше UI обновляется
+/// событием `audio-devices-changed` от `audio_watch`).
+#[tauri::command]
+pub fn list_audio_devices() -> Result<crate::audio_watch::AudioDevices, String> {
+    crate::audio_watch::snapshot()
 }
 
-/// Список аудио-устройств для UI.
+fn selection(input_device: Option<String>, output_device: Option<String>) -> AudioSelection {
+    AudioSelection {
+        input: input_device,
+        output: output_device,
+    }
+}
+
+/// Активный зонд канала на ВЫБРАННЫХ устройствах (не на системных по умолчанию —
+/// иначе зонд играет не туда, куда слушает пользователь).
 #[tauri::command]
-pub fn list_audio_devices() -> Result<AudioDevices, String> {
-    let list = sonic_audio::list_devices()?;
-    Ok(AudioDevices {
-        inputs: list.inputs,
-        outputs: list.outputs,
-        default_input: list.default_input,
-        default_output: list.default_output,
-    })
+pub fn check_channel(
+    input_device: Option<String>,
+    output_device: Option<String>,
+) -> Result<crate::channel_check::ChannelReport, String> {
+    crate::channel_check::check_channel(&selection(input_device, output_device))
+}
+
+/// Акустическое обнаружение устройств поблизости — тоже на выбранных устройствах.
+#[tauri::command]
+pub fn discover_devices(
+    app: tauri::AppHandle,
+    nickname: String,
+    input_device: Option<String>,
+    output_device: Option<String>,
+) -> Result<(), String> {
+    crate::discovery::discover(app, nickname, selection(input_device, output_device))
 }

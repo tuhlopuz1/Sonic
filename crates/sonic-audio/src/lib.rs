@@ -8,6 +8,8 @@
 pub mod device;
 pub mod duplex;
 pub mod pipeline;
+pub mod resample;
+pub mod streams;
 
 pub use device::{list_devices, DeviceList};
 pub use duplex::{DuplexEngine, EngineConfig};

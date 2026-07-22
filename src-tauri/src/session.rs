@@ -54,11 +54,26 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
-    pub fn start(app: AppHandle, profile: Profile, role: Role) -> Result<SessionHandle, String> {
+    /// `input_device`/`output_device` — имена выбранных в UI устройств; `None` — системные.
+    pub fn start(
+        app: AppHandle,
+        profile: Profile,
+        role: Role,
+        input_device: Option<String>,
+        output_device: Option<String>,
+    ) -> Result<SessionHandle, String> {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (evt_tx, evt_rx) = crossbeam_channel::unbounded::<RxEvent>();
 
-        let engine = DuplexEngine::start(EngineConfig { profile, role }, evt_tx)?;
+        let engine = DuplexEngine::start(
+            EngineConfig {
+                profile,
+                role,
+                input_device,
+                output_device,
+            },
+            evt_tx,
+        )?;
 
         std::thread::Builder::new()
             .name("sonic-session".into())

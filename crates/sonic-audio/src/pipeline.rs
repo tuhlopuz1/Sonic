@@ -217,6 +217,43 @@ mod tests {
         assert_eq!(events[0].mode, PhyMode::Css);
     }
 
+    /// Железо приёмника работает на 44.1 кГц, а протокол — на 48 кГц: сигнал «виден»
+    /// микрофону на его частоте, движок приводит его обратно к канонической. Кадр обязан
+    /// пережить эту пару ресемплингов — иначе на ноутбуках с несовпадающими частотами
+    /// (обычное дело в shared-режиме WASAPI) мессенджер не работает вовсе.
+    fn survives_44100_hardware(mode: PhyMode, text: &[u8]) {
+        use crate::resample::Resampler;
+        let (initiator, responder) = peer_schemes();
+        let tx = Transmitter::new(&initiator);
+        let mut rx = RxDemodulator::new(&responder);
+
+        let frame = Frame::new(
+            FrameHeader::new(mode, FrameType::Data, initiator.role().direction_bit()),
+            text.to_vec(),
+        );
+        let samples = tx.modulate(mode, &frame.serialize()); // канонические 48 кГц
+        let at_mic = Resampler::new(48_000, 44_100).process_all(&samples); // микрофон 44.1
+        let back = Resampler::new(44_100, 48_000).process_all(&at_mic); // обратно в канон
+
+        rx.push_captured(&vec![0.0f32; 3000]);
+        rx.push_captured(&back);
+        rx.push_captured(&vec![0.0f32; 3000]);
+
+        let events = rx.poll();
+        assert_eq!(events.len(), 1, "кадр потерян после ресемплинга 48k↔44.1k ({mode:?})");
+        assert_eq!(Frame::parse(&events[0].bytes).unwrap(), frame);
+    }
+
+    #[test]
+    fn css_survives_44100_hardware() {
+        survives_44100_hardware(PhyMode::Css, b"CSS through a 44.1 kHz sound card");
+    }
+
+    #[test]
+    fn ofdm_survives_44100_hardware() {
+        survives_44100_hardware(PhyMode::OfdmQpsk, b"OFDM through a 44.1 kHz sound card");
+    }
+
     #[test]
     fn silence_produces_no_frames() {
         let (_, responder) = peer_schemes();

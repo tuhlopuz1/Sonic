@@ -3642,7 +3642,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-app"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cpal",
  "crossbeam-channel",

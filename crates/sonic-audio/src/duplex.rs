@@ -5,22 +5,32 @@
 //! владеет; DSP крутится там же, а колбэки cpal (на своих аудио-нитях) трогают только
 //! lock-free кольца (`rtrb`) — никаких аллокаций/блокировок в реальном времени
 //! (PROTOCOL.md §11.2). Наружу отдаётся `Send`-хендл с каналами команд/событий.
+//!
+//! Частоты: весь протокольный DSP идёт на КАНОНИЧЕСКОЙ частоте профиля (48 кГц), а
+//! микрофон и динамик могут работать каждый на своей (в shared-режиме WASAPI они
+//! залочены настройками ОС и часто не совпадают). Приведение — [`crate::resample`]:
+//! микрофон → канон на входе, канон → динамик на выходе.
 
-use crate::device::default_io_config;
+use crate::device::io_config;
 use crate::pipeline::{RxDemodulator, RxEvent, Transmitter};
-use cpal::traits::{DeviceTrait, StreamTrait};
+use crate::resample::Resampler;
+use crate::streams::{build_input_stream, build_output_stream};
+use cpal::traits::StreamTrait;
 use crossbeam_channel::{Receiver, Sender};
 use sonic_protocol::bandplan::{DuplexScheme, Fdd, Profile, Role};
 use sonic_protocol::framing::PhyMode;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub profile: Profile,
     pub role: Role,
+    /// Имя микрофона; `None`/пусто — системный по умолчанию.
+    pub input_device: Option<String>,
+    /// Имя динамика; `None`/пусто — системный по умолчанию.
+    pub output_device: Option<String>,
 }
 
 /// Команда аудио-потоку.
@@ -33,6 +43,7 @@ enum EngineCommand {
 pub struct DuplexEngine {
     cmd_tx: Sender<EngineCommand>,
     handle: Option<JoinHandle<()>>,
+    /// Каноническая частота DSP (не обязательно частота железа).
     pub sample_rate: u32,
 }
 
@@ -85,20 +96,35 @@ fn run_engine(
     init_tx: mpsc::Sender<Result<u32, String>>,
 ) {
     let scheme = Fdd::new(cfg.role, cfg.profile);
-    let target_rate = scheme.sample_rate();
+    // Каноническая частота протокола — на ней работают все модемы, независимо от железа.
+    let dsp_rate = scheme.sample_rate();
 
-    let io = match default_io_config(target_rate) {
+    let io = match io_config(
+        dsp_rate,
+        cfg.input_device.as_deref(),
+        cfg.output_device.as_deref(),
+    ) {
         Ok(io) => io,
         Err(e) => {
             let _ = init_tx.send(Err(e));
             return;
         }
     };
-    let sr = io.input_config.sample_rate().0;
+    let in_rate = io.input_rate();
+    let out_rate = io.output_rate();
 
-    // Кольца: микрофон → обработка, обработка → динамик. Ёмкость ~1 c.
-    let (mut mic_prod, mut mic_cons) = rtrb::RingBuffer::<f32>::new(sr as usize);
-    let (mut spk_prod, mut spk_cons) = rtrb::RingBuffer::<f32>::new(sr as usize);
+    // Диагностика: на проблемном железе сразу видно реальные форматы/частоты.
+    eprintln!(
+        "sonic-audio: DSP {dsp_rate} Гц | вход {:?} {in_rate} Гц ({} кан.) | выход {:?} {out_rate} Гц ({} кан.)",
+        io.input_config.sample_format(),
+        io.input_config.channels(),
+        io.output_config.sample_format(),
+        io.output_config.channels(),
+    );
+
+    // Кольца: микрофон → обработка, обработка → динамик. Ёмкость ~1 c на своей частоте.
+    let (mut mic_prod, mut mic_cons) = rtrb::RingBuffer::<f32>::new(in_rate as usize);
+    let (mut spk_prod, mut spk_cons) = rtrb::RingBuffer::<f32>::new(out_rate as usize);
 
     let in_stream = match build_input_stream(&io.input_device, &io.input_config, move |mono| {
         let _ = mic_prod.push(mono);
@@ -127,39 +153,46 @@ fn run_engine(
         return;
     }
 
-    // Схема, построенная под реальную частоту устройства (если она не совпала с целью).
-    let scheme = FddAt { inner: scheme, sr };
     let mut rx = RxDemodulator::new(&scheme);
     let tx = Transmitter::new(&scheme);
-    // Очередь исходящих сэмплов, которые постепенно скармливаются в кольцо динамика.
+    // Микрофон → каноническая частота (состояние сохраняется между блоками).
+    let mut in_resampler = Resampler::new(in_rate, dsp_rate);
+    // Очередь исходящих сэмплов (уже в частоте динамика).
     let mut tx_pending: std::collections::VecDeque<f32> = std::collections::VecDeque::new();
 
-    let _ = init_tx.send(Ok(sr));
+    let _ = init_tx.send(Ok(dsp_rate));
 
-    let mut capture = vec![0.0f32; 4096];
+    let mut raw = Vec::with_capacity(8192);
+    let mut resampled = Vec::with_capacity(8192);
     loop {
         // 1. Команды.
         match cmd_rx.try_recv() {
             Ok(EngineCommand::Stop) | Err(crossbeam_channel::TryRecvError::Disconnected) => break,
             Ok(EngineCommand::Send { mode, bytes }) => {
                 let samples = tx.modulate(mode, &bytes);
-                tx_pending.extend(samples);
+                // Отвод AEC-reference — в канонической частоте, в одном домене с приёмом.
+                rx.push_reference(&samples);
+                // Кадр самодостаточен по синхронизации, поэтому ресемплим его целиком
+                // отдельным ресемплером (состояние между кадрами не нужно).
+                let played = if out_rate == dsp_rate {
+                    samples
+                } else {
+                    Resampler::new(dsp_rate, out_rate).process_all(&samples)
+                };
+                tx_pending.extend(played);
             }
             Err(crossbeam_channel::TryRecvError::Empty) => {}
         }
 
-        // 2. Забираем захваченные сэмплы в приёмный конвейер.
-        let mut got = 0;
+        // 2. Захваченные сэмплы → каноническая частота → приёмный конвейер.
+        raw.clear();
         while let Ok(s) = mic_cons.pop() {
-            capture[got] = s;
-            got += 1;
-            if got == capture.len() {
-                rx.push_captured(&capture[..got]);
-                got = 0;
-            }
+            raw.push(s);
         }
-        if got > 0 {
-            rx.push_captured(&capture[..got]);
+        if !raw.is_empty() {
+            resampled.clear();
+            in_resampler.process(&raw, &mut resampled);
+            rx.push_captured(&resampled);
         }
 
         // 3. Демодуляция → события наверх.
@@ -169,13 +202,12 @@ fn run_engine(
             }
         }
 
-        // 4. Скармливаем исходящие сэмплы в кольцо динамика (+ отвод reference для AEC).
+        // 4. Скармливаем исходящие сэмплы в кольцо динамика.
         while spk_prod.slots() > 0 {
             let s = match tx_pending.pop_front() {
                 Some(s) => s,
                 None => break,
             };
-            rx.push_reference(&[s]);
             if spk_prod.push(s).is_err() {
                 break;
             }
@@ -186,149 +218,4 @@ fn run_engine(
 
     drop(in_stream);
     drop(out_stream);
-}
-
-/// Обёртка `Fdd` с реальной частотой устройства (устройство может не дать ровно 48 кГц).
-#[derive(Clone, Copy)]
-struct FddAt {
-    inner: Fdd,
-    sr: u32,
-}
-
-impl sonic_protocol::bandplan::DuplexScheme for FddAt {
-    fn tx_band(&self) -> sonic_protocol::bandplan::SubBand {
-        self.inner.tx_band()
-    }
-    fn rx_band(&self) -> sonic_protocol::bandplan::SubBand {
-        self.inner.rx_band()
-    }
-    fn sample_rate(&self) -> u32 {
-        self.sr
-    }
-    fn role(&self) -> Role {
-        self.inner.role()
-    }
-    fn echo_canceller(&self) -> Box<dyn sonic_protocol::bandplan::EchoCanceller> {
-        self.inner.echo_canceller()
-    }
-}
-
-fn build_input_stream(
-    device: &cpal::Device,
-    config: &cpal::SupportedStreamConfig,
-    mut on_mono: impl FnMut(f32) + Send + 'static,
-) -> Result<cpal::Stream, String> {
-    let channels = config.channels().max(1) as usize;
-    let stream_config = config.config();
-    let err_fn = |e| eprintln!("sonic-audio: input stream error: {e}");
-
-    let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            &stream_config,
-            move |data: &[f32], _| {
-                let _ = catch_unwind(AssertUnwindSafe(|| {
-                    for frame in data.chunks(channels) {
-                        on_mono(frame.iter().sum::<f32>() / channels as f32);
-                    }
-                }));
-            },
-            err_fn,
-            None,
-        ),
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            &stream_config,
-            move |data: &[i16], _| {
-                let _ = catch_unwind(AssertUnwindSafe(|| {
-                    for frame in data.chunks(channels) {
-                        let m = frame.iter().map(|&s| s as f32 / i16::MAX as f32).sum::<f32>()
-                            / channels as f32;
-                        on_mono(m);
-                    }
-                }));
-            },
-            err_fn,
-            None,
-        ),
-        cpal::SampleFormat::U16 => device.build_input_stream(
-            &stream_config,
-            move |data: &[u16], _| {
-                let _ = catch_unwind(AssertUnwindSafe(|| {
-                    for frame in data.chunks(channels) {
-                        let m = frame
-                            .iter()
-                            .map(|&s| (s as f32 - 32768.0) / 32768.0)
-                            .sum::<f32>()
-                            / channels as f32;
-                        on_mono(m);
-                    }
-                }));
-            },
-            err_fn,
-            None,
-        ),
-        other => return Err(format!("Неподдерживаемый формат микрофона: {other:?}")),
-    }
-    .map_err(|e| format!("Открытие потока записи: {e}"))?;
-    Ok(stream)
-}
-
-fn build_output_stream(
-    device: &cpal::Device,
-    config: &cpal::SupportedStreamConfig,
-    mut next_sample: impl FnMut() -> f32 + Send + 'static,
-) -> Result<cpal::Stream, String> {
-    let channels = config.channels().max(1) as usize;
-    let stream_config = config.config();
-    let err_fn = |e| eprintln!("sonic-audio: output stream error: {e}");
-
-    let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => device.build_output_stream(
-            &stream_config,
-            move |data: &mut [f32], _| {
-                let _ = catch_unwind(AssertUnwindSafe(|| {
-                    for frame in data.chunks_mut(channels) {
-                        let s = next_sample();
-                        for c in frame.iter_mut() {
-                            *c = s;
-                        }
-                    }
-                }));
-            },
-            err_fn,
-            None,
-        ),
-        cpal::SampleFormat::I16 => device.build_output_stream(
-            &stream_config,
-            move |data: &mut [i16], _| {
-                let _ = catch_unwind(AssertUnwindSafe(|| {
-                    for frame in data.chunks_mut(channels) {
-                        let v = (next_sample().clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-                        for c in frame.iter_mut() {
-                            *c = v;
-                        }
-                    }
-                }));
-            },
-            err_fn,
-            None,
-        ),
-        cpal::SampleFormat::U16 => device.build_output_stream(
-            &stream_config,
-            move |data: &mut [u16], _| {
-                let _ = catch_unwind(AssertUnwindSafe(|| {
-                    for frame in data.chunks_mut(channels) {
-                        let u = ((next_sample().clamp(-1.0, 1.0) * 32768.0) + 32768.0) as u16;
-                        for c in frame.iter_mut() {
-                            *c = u;
-                        }
-                    }
-                }));
-            },
-            err_fn,
-            None,
-        ),
-        other => return Err(format!("Неподдерживаемый формат динамика: {other:?}")),
-    }
-    .map_err(|e| format!("Открытие потока воспроизведения: {e}"))?;
-    Ok(stream)
 }

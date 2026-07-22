@@ -9,19 +9,16 @@
 //! Это самостоятельная оценка канала, не часть будущего протокола (`plan.md`/`PROTOCOL.md`) —
 //! реального модема/FEC здесь нет, только измерение и рекомендация режима.
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::StreamTrait;
 use serde::{Deserialize, Serialize};
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// Паника внутри аудио-колбэка cpal на Android разворачивается через C++-границу
-/// (Oboe) — это UB, и Rust реагирует немедленным `abort()` всего процесса вместо
-/// обычного `Result::Err`, который дошёл бы до JS. Поэтому: (1) тело каждого колбэка
-/// обёрнуто в `catch_unwind`, чтобы паника не покидала Rust-код вообще, и (2) блокировки
-/// не паникуют на "отравленном" мьютексе — если паника всё же случится с удержанным
-/// логом, следующий вызов не должен уронить всё приложение вторично.
+/// Блокировка, не паникующая на "отравленном" мьютексе: если паника всё же случится с
+/// удержанным логом, следующий вызов не должен уронить всё приложение вторично.
+/// (Сам `catch_unwind` вокруг тела аудио-колбэка живёт в `sonic_audio::streams` —
+/// паника внутри колбэка на Android разворачивается через C++-границу Oboe, это UB.)
 fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -54,7 +51,30 @@ pub struct ChannelReport {
     pub per_tone: Vec<TonePoint>,
 }
 
-pub fn check_channel() -> Result<ChannelReport, String> {
+/// Выбранные в UI устройства; `None`/пусто — системные по умолчанию. Проверка канала и
+/// обнаружение обязаны использовать ТЕ ЖЕ устройства, что и сессия, иначе зонд играет
+/// не туда, куда слушает пользователь (например, Windows переключил вывод по умолчанию
+/// на только что воткнутую гарнитуру).
+#[derive(Debug, Clone, Default)]
+pub struct AudioSelection {
+    pub input: Option<String>,
+    pub output: Option<String>,
+}
+
+impl AudioSelection {
+    pub fn input_name(&self) -> Option<&str> {
+        self.input.as_deref().filter(|s| !s.trim().is_empty())
+    }
+    pub fn output_name(&self) -> Option<&str> {
+        self.output.as_deref().filter(|s| !s.trim().is_empty())
+    }
+}
+
+/// Целевая частота: та же, что у протокола, но если устройство её не умеет —
+/// используется его дефолтная (зонд подстраивается под фактическую).
+const TARGET_RATE: u32 = 48_000;
+
+pub fn check_channel(selection: &AudioSelection) -> Result<ChannelReport, String> {
     if !crate::android_permissions::ensure_record_audio_permission()? {
         return Err(
             "Доступ к микрофону не разрешён (RECORD_AUDIO). Разрешите доступ к микрофону для этого приложения в настройках Android и повторите проверку."
@@ -62,25 +82,16 @@ pub fn check_channel() -> Result<ChannelReport, String> {
         );
     }
 
-    let host = cpal::default_host();
-    let input_device = host
-        .default_input_device()
-        .ok_or_else(|| "Микрофон не найден".to_string())?;
-    let output_device = host
-        .default_output_device()
-        .ok_or_else(|| "Динамик не найден".to_string())?;
-
-    let input_config = input_device
-        .default_input_config()
-        .map_err(|e| format!("Не удалось получить конфигурацию микрофона: {e}"))?;
-    let output_config = output_device
-        .default_output_config()
-        .map_err(|e| format!("Не удалось получить конфигурацию динамика: {e}"))?;
+    let (input_device, input_config) =
+        sonic_audio::device::open_input(TARGET_RATE, selection.input_name())?;
+    let (output_device, output_config) =
+        sonic_audio::device::open_output(TARGET_RATE, selection.output_name())?;
 
     let output_sample_rate = output_config.sample_rate().0 as f32;
 
     // Фаза 1: фоновый шум (записываем, ничего не проигрывая).
-    let (noise_samples, input_sample_rate) = capture_audio(NOISE_CAPTURE_MS)?;
+    let (noise_samples, input_sample_rate) =
+        capture_audio(NOISE_CAPTURE_MS, selection.input_name())?;
     let min_noise_samples = ((input_sample_rate * MIN_VALID_SAMPLES_MS as f32) / 1000.0) as usize;
 
     // Фаза 2: мульти-тоновый зонд, играем и пишем одновременно.
@@ -116,10 +127,13 @@ pub fn check_channel() -> Result<ChannelReport, String> {
     Ok(analyze(&noise_samples, &tone_samples, input_sample_rate))
 }
 
-/// Пишет `duration_ms` с микрофона по умолчанию и возвращает (сэмплы, sample_rate).
-/// Используется и локальным самотестом (шумовой пол), и акустическим обнаружением
-/// устройств (`discovery.rs`, шумовой пол перед раундом).
-pub(crate) fn capture_audio(duration_ms: u64) -> Result<(Vec<f32>, f32), String> {
+/// Пишет `duration_ms` с выбранного микрофона (`None` — системный) и возвращает
+/// (сэмплы, sample_rate). Используется и локальным самотестом (шумовой пол), и
+/// акустическим обнаружением устройств (`discovery.rs`, шумовой пол перед раундом).
+pub(crate) fn capture_audio(
+    duration_ms: u64,
+    input_name: Option<&str>,
+) -> Result<(Vec<f32>, f32), String> {
     if !crate::android_permissions::ensure_record_audio_permission()? {
         return Err(
             "Доступ к микрофону не разрешён (RECORD_AUDIO). Разрешите доступ к микрофону для этого приложения в настройках Android и повторите проверку."
@@ -127,13 +141,7 @@ pub(crate) fn capture_audio(duration_ms: u64) -> Result<(Vec<f32>, f32), String>
         );
     }
 
-    let host = cpal::default_host();
-    let input_device = host
-        .default_input_device()
-        .ok_or_else(|| "Микрофон не найден".to_string())?;
-    let input_config = input_device
-        .default_input_config()
-        .map_err(|e| format!("Не удалось получить конфигурацию микрофона: {e}"))?;
+    let (input_device, input_config) = sonic_audio::device::open_input(TARGET_RATE, input_name)?;
     let sample_rate = input_config.sample_rate().0 as f32;
 
     let buf = Arc::new(Mutex::new(Vec::<f32>::new()));
@@ -288,131 +296,29 @@ fn quality_label(snr_db: f32, noise_floor_db: f32) -> String {
     format!("{} (фон {noise_floor_db:.0} дБФС)", clarity_label(snr_db))
 }
 
+/// Поток записи, складывающий моно-сэмплы в общий буфер. Формат сэмплов устройства
+/// (F32/I16/U16/U8/…) снимается обобщённо в `sonic_audio::streams` — иначе железо с
+/// нестандартным форматом (например, U8) вообще не открывалось.
 pub(crate) fn build_input_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
     buffer: Arc<Mutex<Vec<f32>>>,
 ) -> Result<cpal::Stream, String> {
-    let channels = config.channels() as usize;
-    let stream_config = config.config();
-    let err_fn = |err| eprintln!("channel_check: input stream error: {err}");
-
-    let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            &stream_config,
-            move |data: &[f32], _| {
-                let _ = catch_unwind(AssertUnwindSafe(|| {
-                    let mut buf = lock_recover(&buffer);
-                    for frame in data.chunks(channels.max(1)) {
-                        buf.push(frame.iter().sum::<f32>() / frame.len() as f32);
-                    }
-                }));
-            },
-            err_fn,
-            None,
-        ),
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            &stream_config,
-            move |data: &[i16], _| {
-                let _ = catch_unwind(AssertUnwindSafe(|| {
-                    let mut buf = lock_recover(&buffer);
-                    for frame in data.chunks(channels.max(1)) {
-                        let mono = frame.iter().map(|&s| s as f32 / i16::MAX as f32).sum::<f32>()
-                            / frame.len() as f32;
-                        buf.push(mono);
-                    }
-                }));
-            },
-            err_fn,
-            None,
-        ),
-        cpal::SampleFormat::U16 => device.build_input_stream(
-            &stream_config,
-            move |data: &[u16], _| {
-                let _ = catch_unwind(AssertUnwindSafe(|| {
-                    let mut buf = lock_recover(&buffer);
-                    for frame in data.chunks(channels.max(1)) {
-                        let mono = frame
-                            .iter()
-                            .map(|&s| (s as f32 - 32768.0) / 32768.0)
-                            .sum::<f32>()
-                            / frame.len() as f32;
-                        buf.push(mono);
-                    }
-                }));
-            },
-            err_fn,
-            None,
-        ),
-        other => return Err(format!("Неподдерживаемый формат сэмплов микрофона: {other:?}")),
-    }
-    .map_err(|e| format!("Не удалось открыть поток записи: {e}"))?;
-    Ok(stream)
+    sonic_audio::streams::build_input_stream(device, config, move |mono| {
+        lock_recover(&buffer).push(mono);
+    })
 }
 
+/// Поток воспроизведения, проигрывающий заранее подготовленный буфер `probe`
+/// (позиция — общий атомарный счётчик); после конца буфера отдаёт тишину.
 pub(crate) fn build_output_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
     probe: Arc<Vec<f32>>,
     position: Arc<AtomicUsize>,
 ) -> Result<cpal::Stream, String> {
-    let channels = config.channels() as usize;
-    let stream_config = config.config();
-    let err_fn = |err| eprintln!("channel_check: output stream error: {err}");
-
-    let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => device.build_output_stream(
-            &stream_config,
-            move |data: &mut [f32], _| {
-                let _ = catch_unwind(AssertUnwindSafe(|| {
-                    for frame in data.chunks_mut(channels.max(1)) {
-                        let idx = position.fetch_add(1, Ordering::Relaxed);
-                        let sample = probe.get(idx).copied().unwrap_or(0.0);
-                        for s in frame.iter_mut() {
-                            *s = sample;
-                        }
-                    }
-                }));
-            },
-            err_fn,
-            None,
-        ),
-        cpal::SampleFormat::I16 => device.build_output_stream(
-            &stream_config,
-            move |data: &mut [i16], _| {
-                let _ = catch_unwind(AssertUnwindSafe(|| {
-                    for frame in data.chunks_mut(channels.max(1)) {
-                        let idx = position.fetch_add(1, Ordering::Relaxed);
-                        let sample = probe.get(idx).copied().unwrap_or(0.0);
-                        let s16 = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-                        for s in frame.iter_mut() {
-                            *s = s16;
-                        }
-                    }
-                }));
-            },
-            err_fn,
-            None,
-        ),
-        cpal::SampleFormat::U16 => device.build_output_stream(
-            &stream_config,
-            move |data: &mut [u16], _| {
-                let _ = catch_unwind(AssertUnwindSafe(|| {
-                    for frame in data.chunks_mut(channels.max(1)) {
-                        let idx = position.fetch_add(1, Ordering::Relaxed);
-                        let sample = probe.get(idx).copied().unwrap_or(0.0);
-                        let u = ((sample.clamp(-1.0, 1.0) * 32768.0) + 32768.0) as u16;
-                        for s in frame.iter_mut() {
-                            *s = u;
-                        }
-                    }
-                }));
-            },
-            err_fn,
-            None,
-        ),
-        other => return Err(format!("Неподдерживаемый формат сэмплов динамика: {other:?}")),
-    }
-    .map_err(|e| format!("Не удалось открыть поток воспроизведения: {e}"))?;
-    Ok(stream)
+    sonic_audio::streams::build_output_stream(device, config, move || {
+        let idx = position.fetch_add(1, Ordering::Relaxed);
+        probe.get(idx).copied().unwrap_or(0.0)
+    })
 }

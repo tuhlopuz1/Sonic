@@ -48,6 +48,18 @@
           </div>
         </div>
 
+        <div class="field">
+          <label>Микрофон</label>
+          <select id="input-device" class="select"></select>
+        </div>
+
+        <div class="field">
+          <label>Динамик</label>
+          <select id="output-device" class="select"></select>
+        </div>
+
+        <button id="refresh-devices" type="button" class="link-btn">↻ Обновить список устройств</button>
+
         <button id="start-btn" class="primary block">Запустить сессию</button>
         <p id="setup-error" class="error"></p>
       </section>
@@ -106,6 +118,8 @@
       <!-- Инструменты канала (самопроверка + акустическое обнаружение) -->
       <details class="card tools">
         <summary>Инструменты канала</summary>
+
+        <p class="hint devices-hint" id="tools-devices"></p>
 
         <div class="tool-block">
           <h3>Проверка канала (это устройство)</h3>

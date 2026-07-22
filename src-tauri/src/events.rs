@@ -10,3 +10,6 @@ pub const MESSAGE_STATUS: &str = "message-status";
 pub const LINK_QUALITY: &str = "link-quality";
 /// Смена состояния сессии: `{ state: "up"|"down" }`.
 pub const SESSION_STATE_CHANGED: &str = "session-state-changed";
+/// Изменился список аудио-устройств (hot-plug). Полезная нагрузка — тот же снимок,
+/// что возвращает команда `list_audio_devices`.
+pub const AUDIO_DEVICES_CHANGED: &str = "audio-devices-changed";
