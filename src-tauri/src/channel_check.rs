@@ -11,9 +11,20 @@
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+
+/// Паника внутри аудио-колбэка cpal на Android разворачивается через C++-границу
+/// (Oboe) — это UB, и Rust реагирует немедленным `abort()` всего процесса вместо
+/// обычного `Result::Err`, который дошёл бы до JS. Поэтому: (1) тело каждого колбэка
+/// обёрнуто в `catch_unwind`, чтобы паника не покидала Rust-код вообще, и (2) блокировки
+/// не паникуют на "отравленном" мьютексе — если паника всё же случится с удержанным
+/// логом, следующий вызов не должен уронить всё приложение вторично.
+fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub(crate) const NOISE_CAPTURE_MS: u64 = 700;
 pub(crate) const PROBE_TOTAL_MS: u64 = 1500;
@@ -94,7 +105,7 @@ pub fn check_channel() -> Result<ChannelReport, String> {
         drop(in_stream);
         drop(out_stream);
     }
-    let tone_samples = tone_buf.lock().unwrap().clone();
+    let tone_samples = lock_recover(&tone_buf).clone();
     if tone_samples.len() < min_noise_samples.max(1) {
         return Err(
             "Микрофон не отдал ни одного сэмпла во время зонда — проверьте разрешение на запись звука"
@@ -134,7 +145,7 @@ pub(crate) fn capture_audio(duration_ms: u64) -> Result<(Vec<f32>, f32), String>
         std::thread::sleep(Duration::from_millis(duration_ms));
         drop(stream);
     }
-    let samples = buf.lock().unwrap().clone();
+    let samples = lock_recover(&buf).clone();
     let min_samples = ((sample_rate * MIN_VALID_SAMPLES_MS as f32) / 1000.0) as usize;
     if samples.len() < min_samples.max(1) {
         return Err(
@@ -290,10 +301,12 @@ pub(crate) fn build_input_stream(
         cpal::SampleFormat::F32 => device.build_input_stream(
             &stream_config,
             move |data: &[f32], _| {
-                let mut buf = buffer.lock().unwrap();
-                for frame in data.chunks(channels.max(1)) {
-                    buf.push(frame.iter().sum::<f32>() / frame.len() as f32);
-                }
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    let mut buf = lock_recover(&buffer);
+                    for frame in data.chunks(channels.max(1)) {
+                        buf.push(frame.iter().sum::<f32>() / frame.len() as f32);
+                    }
+                }));
             },
             err_fn,
             None,
@@ -301,12 +314,14 @@ pub(crate) fn build_input_stream(
         cpal::SampleFormat::I16 => device.build_input_stream(
             &stream_config,
             move |data: &[i16], _| {
-                let mut buf = buffer.lock().unwrap();
-                for frame in data.chunks(channels.max(1)) {
-                    let mono = frame.iter().map(|&s| s as f32 / i16::MAX as f32).sum::<f32>()
-                        / frame.len() as f32;
-                    buf.push(mono);
-                }
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    let mut buf = lock_recover(&buffer);
+                    for frame in data.chunks(channels.max(1)) {
+                        let mono = frame.iter().map(|&s| s as f32 / i16::MAX as f32).sum::<f32>()
+                            / frame.len() as f32;
+                        buf.push(mono);
+                    }
+                }));
             },
             err_fn,
             None,
@@ -314,15 +329,17 @@ pub(crate) fn build_input_stream(
         cpal::SampleFormat::U16 => device.build_input_stream(
             &stream_config,
             move |data: &[u16], _| {
-                let mut buf = buffer.lock().unwrap();
-                for frame in data.chunks(channels.max(1)) {
-                    let mono = frame
-                        .iter()
-                        .map(|&s| (s as f32 - 32768.0) / 32768.0)
-                        .sum::<f32>()
-                        / frame.len() as f32;
-                    buf.push(mono);
-                }
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    let mut buf = lock_recover(&buffer);
+                    for frame in data.chunks(channels.max(1)) {
+                        let mono = frame
+                            .iter()
+                            .map(|&s| (s as f32 - 32768.0) / 32768.0)
+                            .sum::<f32>()
+                            / frame.len() as f32;
+                        buf.push(mono);
+                    }
+                }));
             },
             err_fn,
             None,
@@ -347,13 +364,15 @@ pub(crate) fn build_output_stream(
         cpal::SampleFormat::F32 => device.build_output_stream(
             &stream_config,
             move |data: &mut [f32], _| {
-                for frame in data.chunks_mut(channels.max(1)) {
-                    let idx = position.fetch_add(1, Ordering::Relaxed);
-                    let sample = probe.get(idx).copied().unwrap_or(0.0);
-                    for s in frame.iter_mut() {
-                        *s = sample;
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    for frame in data.chunks_mut(channels.max(1)) {
+                        let idx = position.fetch_add(1, Ordering::Relaxed);
+                        let sample = probe.get(idx).copied().unwrap_or(0.0);
+                        for s in frame.iter_mut() {
+                            *s = sample;
+                        }
                     }
-                }
+                }));
             },
             err_fn,
             None,
@@ -361,14 +380,16 @@ pub(crate) fn build_output_stream(
         cpal::SampleFormat::I16 => device.build_output_stream(
             &stream_config,
             move |data: &mut [i16], _| {
-                for frame in data.chunks_mut(channels.max(1)) {
-                    let idx = position.fetch_add(1, Ordering::Relaxed);
-                    let sample = probe.get(idx).copied().unwrap_or(0.0);
-                    let s16 = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-                    for s in frame.iter_mut() {
-                        *s = s16;
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    for frame in data.chunks_mut(channels.max(1)) {
+                        let idx = position.fetch_add(1, Ordering::Relaxed);
+                        let sample = probe.get(idx).copied().unwrap_or(0.0);
+                        let s16 = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                        for s in frame.iter_mut() {
+                            *s = s16;
+                        }
                     }
-                }
+                }));
             },
             err_fn,
             None,
@@ -376,14 +397,16 @@ pub(crate) fn build_output_stream(
         cpal::SampleFormat::U16 => device.build_output_stream(
             &stream_config,
             move |data: &mut [u16], _| {
-                for frame in data.chunks_mut(channels.max(1)) {
-                    let idx = position.fetch_add(1, Ordering::Relaxed);
-                    let sample = probe.get(idx).copied().unwrap_or(0.0);
-                    let u = ((sample.clamp(-1.0, 1.0) * 32768.0) + 32768.0) as u16;
-                    for s in frame.iter_mut() {
-                        *s = u;
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    for frame in data.chunks_mut(channels.max(1)) {
+                        let idx = position.fetch_add(1, Ordering::Relaxed);
+                        let sample = probe.get(idx).copied().unwrap_or(0.0);
+                        let u = ((sample.clamp(-1.0, 1.0) * 32768.0) + 32768.0) as u16;
+                        for s in frame.iter_mut() {
+                            *s = u;
+                        }
                     }
-                }
+                }));
             },
             err_fn,
             None,
