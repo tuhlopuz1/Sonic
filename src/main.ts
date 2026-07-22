@@ -1,23 +1,231 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-let greetInputEl: HTMLInputElement | null;
-let greetMsgEl: HTMLElement | null;
+// ─────────────────────────────────────────────────────────────────────────────
+// Мессенджер: весь звук/DSP — на стороне Rust (sonic-protocol/sonic-audio). Здесь
+// только UI: старт сессии, отправка текста, отрисовка входящих сообщений и телеметрии
+// качества связи, приходящей событиями (см. events.rs / session.rs).
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function greet() {
-  if (greetMsgEl && greetInputEl) {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsgEl.textContent = await invoke("greet", {
-      name: greetInputEl.value,
+type Role = "initiator" | "responder";
+type Profile = "audible" | "ultrasonic";
+type ModePolicy = "auto" | "css" | "ofdm";
+
+interface MessageReceived {
+  text: string;
+}
+interface MessageStatus {
+  msg_id: number;
+  status: "sent" | "delivered";
+  text: string;
+}
+interface LinkQuality {
+  snr_db: number;
+  mode: string;
+  retransmits: number;
+  rtt_ms: number;
+  frames_ok: number;
+  frames_bad: number;
+  per: number;
+  in_flight: number;
+}
+interface SessionStateChanged {
+  state: "up" | "down";
+}
+
+let selectedRole: Role = "initiator";
+let selectedProfile: Profile = "audible";
+let sessionUp = false;
+// Сопоставление msg_id → DOM-элемент исходящего пузыря (для обновления статуса).
+const outgoing = new Map<number, HTMLElement>();
+
+const $ = <T extends HTMLElement>(sel: string) => document.querySelector<T>(sel);
+
+// ── Переключатели (segmented controls) ──────────────────────────────────────
+
+function wireSegmented(containerSel: string, onPick: (value: string) => void) {
+  const container = $(containerSel);
+  container?.querySelectorAll<HTMLButtonElement>("button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (btn.disabled) return;
+      container.querySelectorAll("button").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      onPick(btn.dataset.role ?? btn.dataset.profile ?? btn.dataset.mode ?? "");
     });
+  });
+}
+
+// ── Сессия ──────────────────────────────────────────────────────────────────
+
+async function startSession() {
+  const errorEl = $("#setup-error");
+  const startBtn = $<HTMLButtonElement>("#start-btn");
+  if (errorEl) errorEl.textContent = "";
+  if (startBtn) startBtn.disabled = true;
+  try {
+    await invoke("start_session", { profile: selectedProfile, role: selectedRole });
+    // Дальше UI переключит session-state-changed → "up".
+  } catch (err) {
+    if (errorEl) errorEl.textContent = `Ошибка запуска: ${err}`;
+    if (startBtn) startBtn.disabled = false;
   }
 }
+
+async function stopSession() {
+  try {
+    await invoke("stop_session");
+  } catch (err) {
+    console.error("stop_session", err);
+  }
+  setSessionUp(false);
+}
+
+function setSessionUp(up: boolean) {
+  sessionUp = up;
+  const badge = $("#session-badge");
+  const setup = $("#setup");
+  const chat = $("#chat");
+  const startBtn = $<HTMLButtonElement>("#start-btn");
+  if (badge) {
+    badge.textContent = up ? "в эфире" : "офлайн";
+    badge.classList.toggle("off", !up);
+    badge.classList.toggle("on", up);
+  }
+  setup?.classList.toggle("hidden", up);
+  chat?.classList.toggle("hidden", !up);
+  if (startBtn) startBtn.disabled = false;
+  if (up) $<HTMLInputElement>("#msg-input")?.focus();
+}
+
+// ── Сообщения ────────────────────────────────────────────────────────────────
+
+function hideEmptyHint() {
+  $("#empty-hint")?.remove();
+}
+
+function appendBubble(text: string, kind: "in" | "out"): HTMLElement {
+  hideEmptyHint();
+  const list = $("#messages");
+  const bubble = document.createElement("div");
+  bubble.className = `bubble ${kind}`;
+  const body = document.createElement("div");
+  body.className = "bubble-text";
+  body.textContent = text;
+  bubble.appendChild(body);
+  if (kind === "out") {
+    const status = document.createElement("span");
+    status.className = "bubble-status";
+    status.textContent = "отправляется…";
+    bubble.appendChild(status);
+  }
+  list?.appendChild(bubble);
+  if (list) list.scrollTop = list.scrollHeight;
+  return bubble;
+}
+
+async function sendMessage(e: Event) {
+  e.preventDefault();
+  const input = $<HTMLInputElement>("#msg-input");
+  if (!input) return;
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+  try {
+    // Пузырь появится по событию message-status "sent" — там придёт msg_id для
+    // последующего обновления статуса на "доставлено".
+    await invoke("send_message", { text });
+  } catch (err) {
+    appendBubble(`⚠ не отправлено: ${err}`, "out");
+  }
+}
+
+// ── Режим модуляции ───────────────────────────────────────────────────────────
+
+async function setMode(mode: ModePolicy) {
+  try {
+    await invoke("set_mode", { mode });
+  } catch (err) {
+    console.error("set_mode", err);
+  }
+}
+
+function modeBadgeClass(mode: string): string {
+  if (mode.startsWith("OFDM-16")) return "mode-16qam";
+  if (mode.startsWith("OFDM")) return "mode-qpsk";
+  if (mode === "CSS") return "mode-css";
+  return "";
+}
+
+function renderTelemetry(q: LinkQuality) {
+  const modeEl = $("#tele-mode");
+  if (modeEl) {
+    modeEl.textContent = q.mode;
+    modeEl.className = `tele-value mode-badge ${modeBadgeClass(q.mode)}`;
+  }
+  const set = (sel: string, val: string) => {
+    const el = $(sel);
+    if (el) el.textContent = val;
+  };
+  set("#tele-snr", `${q.snr_db.toFixed(1)} дБ`);
+  set("#tele-rtt", q.rtt_ms > 0 ? `${q.rtt_ms.toFixed(0)} мс` : "— мс");
+  set("#tele-retx", String(q.retransmits));
+  set("#tele-per", `${(q.per * 100).toFixed(0)}%`);
+  set("#tele-inflight", String(q.in_flight));
+}
+
+// ── Инициализация ─────────────────────────────────────────────────────────────
+
+function wireMessenger() {
+  wireSegmented("#role-seg", (v) => (selectedRole = v as Role));
+  wireSegmented("#profile-seg", (v) => (selectedProfile = v as Profile));
+  wireSegmented("#mode-seg", (v) => setMode(v as ModePolicy));
+
+  $("#start-btn")?.addEventListener("click", startSession);
+  $("#stop-btn")?.addEventListener("click", stopSession);
+  $("#composer")?.addEventListener("submit", sendMessage);
+
+  listen<MessageReceived>("message-received", (e) => {
+    appendBubble(e.payload.text, "in");
+  });
+
+  listen<MessageStatus>("message-status", (e) => {
+    const { msg_id, status, text } = e.payload;
+    if (status === "sent") {
+      const bubble = appendBubble(text, "out");
+      outgoing.set(msg_id, bubble);
+    } else if (status === "delivered") {
+      const bubble = outgoing.get(msg_id);
+      const st = bubble?.querySelector<HTMLElement>(".bubble-status");
+      if (st) {
+        st.textContent = "✓✓ доставлено";
+        st.classList.add("delivered");
+      }
+    }
+  });
+
+  listen<LinkQuality>("link-quality", (e) => renderTelemetry(e.payload));
+
+  listen<SessionStateChanged>("session-state-changed", (e) => {
+    if (e.payload.state === "up") setSessionUp(true);
+    else {
+      // Не роняем UI при временном down (LINK_DOWN), только помечаем бейдж.
+      const badge = $("#session-badge");
+      if (badge && sessionUp) {
+        badge.textContent = "нет связи";
+        badge.classList.add("off");
+      }
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Инструменты канала (самопроверка + акустическое обнаружение) — прежний функционал.
+// ─────────────────────────────────────────────────────────────────────────────
 
 interface TonePoint {
   freq_hz: number;
   snr_db: number;
 }
-
 interface ChannelReport {
   noise_floor_db: number;
   signal_db: number;
@@ -28,7 +236,6 @@ interface ChannelReport {
   estimated_bitrate_bps: number;
   per_tone: TonePoint[];
 }
-
 interface DiscoveredDevice {
   nickname: string;
   snr_db: number;
@@ -53,72 +260,46 @@ function modeClass(mode: string): string {
       return "";
   }
 }
-
 function formatBitrate(bps: number): string {
   return bps >= 1000 ? `~${(bps / 1000).toFixed(1)} кбит/с` : `~${bps} бит/с`;
 }
-
 function toneBarsHtml(perTone: TonePoint[]): string {
   return perTone
     .map((t) => {
       const heightPct = Math.max(4, Math.min(100, t.snr_db * 2.5));
       return `
         <div class="tone-bar" title="${t.freq_hz.toFixed(0)} Гц: ${t.snr_db.toFixed(1)} дБ SNR">
-          <div class="tone-bar-track">
-            <div class="tone-bar-fill" style="height:${heightPct}%"></div>
-          </div>
+          <div class="tone-bar-track"><div class="tone-bar-fill" style="height:${heightPct}%"></div></div>
           <span class="tone-freq">${(t.freq_hz / 1000).toFixed(1)}к</span>
-        </div>
-      `;
+        </div>`;
     })
     .join("");
 }
-
 function channelReportHtml(report: ChannelReport): string {
   return `
     <div class="channel-metrics">
-      <div class="metric">
-        <span class="metric-label">Уровень шума</span>
-        <span class="metric-value">${report.noise_floor_db.toFixed(1)} дБФС</span>
-      </div>
-      <div class="metric">
-        <span class="metric-label">SNR сигнала</span>
-        <span class="metric-value">${report.snr_db.toFixed(1)} дБ</span>
-      </div>
-      <div class="metric">
-        <span class="metric-label">Чистота канала</span>
-        <span class="metric-value">${report.quality_label}</span>
-      </div>
+      <div class="metric"><span class="metric-label">Уровень шума</span><span class="metric-value">${report.noise_floor_db.toFixed(1)} дБФС</span></div>
+      <div class="metric"><span class="metric-label">SNR сигнала</span><span class="metric-value">${report.snr_db.toFixed(1)} дБ</span></div>
+      <div class="metric"><span class="metric-label">Чистота канала</span><span class="metric-value">${report.quality_label}</span></div>
     </div>
-    <div class="mode-badge ${modeClass(report.recommended_mode)}">
+    <div class="mode-badge big ${modeClass(report.recommended_mode)}">
       <div class="mode-name">${report.mode_label}</div>
       <div class="mode-rate">${formatBitrate(report.estimated_bitrate_bps)}</div>
     </div>
-    <div class="tone-bars">${toneBarsHtml(report.per_tone)}</div>
-  `;
+    <div class="tone-bars">${toneBarsHtml(report.per_tone)}</div>`;
 }
-
-function renderChannelReport(report: ChannelReport) {
-  const resultEl = document.querySelector<HTMLElement>("#channel-result");
-  if (!resultEl) return;
-  resultEl.innerHTML = channelReportHtml(report);
-}
-
 async function checkChannel() {
-  const btn = document.querySelector<HTMLButtonElement>("#check-channel-btn");
-  const statusEl = document.querySelector<HTMLElement>("#channel-status");
-  const resultEl = document.querySelector<HTMLElement>("#channel-result");
+  const btn = $<HTMLButtonElement>("#check-channel-btn");
+  const statusEl = $("#channel-status");
+  const resultEl = $("#channel-result");
   if (!btn || !statusEl || !resultEl) return;
-
   btn.disabled = true;
   resultEl.innerHTML = "";
-  statusEl.textContent =
-    "Проверка канала: тишина, затем тестовый сигнал через колонки (~2 c)…";
-
+  statusEl.textContent = "Проверка: тишина, затем тестовый сигнал (~2 c)…";
   try {
     const report = await invoke<ChannelReport>("check_channel");
     statusEl.textContent = "Готово";
-    renderChannelReport(report);
+    resultEl.innerHTML = channelReportHtml(report);
   } catch (err) {
     statusEl.textContent = `Ошибка: ${err}`;
   } finally {
@@ -128,7 +309,6 @@ async function checkChannel() {
 
 const NICKNAME_STORAGE_KEY = "sonic-nickname";
 const discoveredDevices = new Map<string, DiscoveredDevice>();
-
 function loadOrCreateNickname(): string {
   const stored = localStorage.getItem(NICKNAME_STORAGE_KEY);
   if (stored) return stored;
@@ -136,52 +316,41 @@ function loadOrCreateNickname(): string {
   localStorage.setItem(NICKNAME_STORAGE_KEY, generated);
   return generated;
 }
-
 function renderDiscoveryList() {
-  const listEl = document.querySelector<HTMLElement>("#discovery-list");
+  const listEl = $("#discovery-list");
   if (!listEl) return;
   const devices = [...discoveredDevices.values()].sort((a, b) => b.snr_db - a.snr_db);
-  if (devices.length === 0) {
-    listEl.innerHTML = "";
-    return;
-  }
   listEl.innerHTML = devices
     .map(
       (d) => `
-        <li class="discovery-item">
-          <span class="discovery-nickname">${d.nickname}</span>
-          <span class="discovery-snr">${d.snr_db.toFixed(1)} дБ SNR — ${d.quality_label}</span>
-          <span class="mode-badge inline ${modeClass(d.recommended_mode)}">
-            <span class="mode-name">${d.mode_label}</span>
-            <span class="mode-rate">${formatBitrate(d.estimated_bitrate_bps)}</span>
-          </span>
-        </li>
-      `
+      <li class="discovery-item">
+        <span class="discovery-nickname">${d.nickname}</span>
+        <span class="discovery-snr">${d.snr_db.toFixed(1)} дБ — ${d.quality_label}</span>
+        <span class="mode-badge inline ${modeClass(d.recommended_mode)}">
+          <span class="mode-name">${d.mode_label}</span>
+          <span class="mode-rate">${formatBitrate(d.estimated_bitrate_bps)}</span>
+        </span>
+      </li>`
     )
     .join("");
 }
-
 function setDiscoveryBusy(busy: boolean) {
-  const btn = document.querySelector<HTMLButtonElement>("#discover-btn");
-  const input = document.querySelector<HTMLInputElement>("#nickname-input");
+  const btn = $<HTMLButtonElement>("#discover-btn");
+  const input = $<HTMLInputElement>("#nickname-input");
   if (btn) btn.disabled = busy;
   if (input) input.disabled = busy;
 }
-
 async function discoverDevices() {
-  const statusEl = document.querySelector<HTMLElement>("#discovery-status");
-  const nicknameInput = document.querySelector<HTMLInputElement>("#nickname-input");
+  const statusEl = $("#discovery-status");
+  const nicknameInput = $<HTMLInputElement>("#nickname-input");
   if (!statusEl || !nicknameInput) return;
-
   const nickname = nicknameInput.value.trim() || loadOrCreateNickname();
   localStorage.setItem(NICKNAME_STORAGE_KEY, nickname);
   nicknameInput.value = nickname;
-
   discoveredDevices.clear();
   renderDiscoveryList();
   setDiscoveryBusy(true);
-  statusEl.textContent = "Ищем устройства рядом (слушаем и проигрываем маячок, ~20 c)…";
-
+  statusEl.textContent = "Слушаем и проигрываем маячок (~20 c)…";
   try {
     await invoke("discover_devices", { nickname });
   } catch (err) {
@@ -190,22 +359,11 @@ async function discoverDevices() {
   }
 }
 
-window.addEventListener("DOMContentLoaded", () => {
-  greetInputEl = document.querySelector("#greet-input");
-  greetMsgEl = document.querySelector("#greet-msg");
-  document.querySelector("#greet-form")?.addEventListener("submit", (e) => {
-    e.preventDefault();
-    greet();
-  });
-
-  document
-    .querySelector("#check-channel-btn")
-    ?.addEventListener("click", () => checkChannel());
-
-  const nicknameInput = document.querySelector<HTMLInputElement>("#nickname-input");
+function wireTools() {
+  $("#check-channel-btn")?.addEventListener("click", checkChannel);
+  const nicknameInput = $<HTMLInputElement>("#nickname-input");
   if (nicknameInput) nicknameInput.value = loadOrCreateNickname();
-
-  document.querySelector("#discover-btn")?.addEventListener("click", () => discoverDevices());
+  $("#discover-btn")?.addEventListener("click", discoverDevices);
 
   listen<DiscoveredDevice>("device-discovered", (event) => {
     const device = event.payload;
@@ -215,20 +373,23 @@ window.addEventListener("DOMContentLoaded", () => {
       renderDiscoveryList();
     }
   });
-
   listen<string>("discovery-error", (event) => {
-    const statusEl = document.querySelector<HTMLElement>("#discovery-status");
+    const statusEl = $("#discovery-status");
     if (statusEl) statusEl.textContent = `Ошибка: ${event.payload}`;
   });
-
   listen("discovery-finished", () => {
-    const statusEl = document.querySelector<HTMLElement>("#discovery-status");
+    const statusEl = $("#discovery-status");
     if (statusEl) {
       statusEl.textContent =
         discoveredDevices.size > 0
-          ? `Поиск завершён, найдено устройств: ${discoveredDevices.size}`
-          : "Поиск завершён, никого не услышали";
+          ? `Найдено устройств: ${discoveredDevices.size}`
+          : "Никого не услышали";
     }
     setDiscoveryBusy(false);
   });
+}
+
+window.addEventListener("DOMContentLoaded", () => {
+  wireMessenger();
+  wireTools();
 });

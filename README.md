@@ -1,7 +1,110 @@
-# Tauri + Vanilla TS
+# Sonic — full-duplex акустический мессенджер (ADL/1)
 
-This template should help get you started developing with Tauri in vanilla HTML, CSS and Typescript.
+Передача текстовых сообщений между устройствами **через звук**, когда обычная связь
+недоступна: динамик одного устройства → микрофон другого. Кроссплатформенно (Tauri 2:
+Windows/Linux/macOS + Android). Вся логика звука/DSP — на Rust; TypeScript — только UI.
 
-## Recommended IDE Setup
+Спецификации: [`plan.md`](plan.md) (дорожная карта) и [`PROTOCOL.md`](PROTOCOL.md)
+(протокол ADL/1). Задача хакатона — в [`task.md`](task.md).
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+## Архитектура
+
+Cargo workspace из трёх крейтов + фронтенд:
+
+```
+crates/sonic-protocol   Чистое DSP/протокольное ядро — без ОС/аудио, юнит-тестируемо.
+  bandplan.rs           План спектра, роль A/B, шов FDD→AEC (DuplexScheme).
+  iq.rs / fft.rs        Квадратурный микшер + полосовой FIR; обёртка rustfft.
+  modem/css.rs          CSS (LoRa-style чирп): модуляция сдвигом чирпа, дечирп+FFT.
+  modem/ofdm.rs+qam.rs  OFDM+QAM: Schmidl-Cox, пилот-эквалайзер, CP, QPSK/16-QAM.
+  framing.rs            PHY/MAC-кадр: робастный mode-agnostic заголовок + CRC32.
+  fec/                  Reed-Solomon GF(256) (своя реализация) + блочный интерливер.
+  arq.rs                Скользящее окно, selective-repeat, auto-fallback режима.
+  sim/                  AWGN / multipath / clock-drift — тесты и BER-замеры.
+  telemetry.rs          LinkQuality (SNR, режим, ретраи, RTT, PER) для UI.
+
+crates/sonic-audio      cpal duplex-движок поверх sonic-protocol.
+  device.rs             Перечисление устройств, форс 48 кГц.
+  pipeline.rs           RX-демодулятор (mode-agnostic) + TX-модулятор + шов AEC-reference.
+  duplex.rs             Одновременные input+output cpal-потоки на своём аудио-потоке.
+
+src-tauri               Tauri-приложение.
+  session.rs            APP/MAC-слой: чанкинг сообщений, FEC, ARQ, ACK, auto-fallback.
+  commands.rs           start_session / stop_session / send_message / set_mode / list_audio_devices.
+  events.rs             Контракт имён событий (message-received / link-quality / …).
+  channel_check.rs, acoustic_beacon.rs, discovery.rs   Самопроверка канала и обнаружение по звуку.
+
+src/ (index.html, main.ts, styles.css)   Чат-UI на vanilla TS: роль/профиль/режим, лента, телеметрия.
+```
+
+Слои (ср. PROTOCOL.md §1): APP → SESSION → **MAC (ARQ)** → **PHY (модем+FEC+framing)** → **AUDIO (cpal)**.
+
+### Ключевые решения
+
+- **Дуплекс — FDD** (частотное разделение): A передаёт в нижней полосе (0.5–7.2 кГц),
+  B — в верхней (7.8–15 кГц), эхо режется полосовым фильтром на приёме. Шов
+  `DuplexScheme`/`EchoCanceller` заложен так, чтобы позже добавить общую полосу + NLMS-AEC
+  без правок модемов; reference-сигнал уже отводится в пайплайне (сейчас no-op).
+- **Два режима модуляции**: CSS (надёжный, ~50 бит/с, работает вплоть до 0 дБ SNR) и
+  OFDM+QAM (быстрый, ~3–10 кбит/с при хорошем SNR), с авто-fallback OFDM→CSS по деградации.
+- **FEC — Reed-Solomon (GF256), своя реализация** (не erasure-крейт): чинит пакетные
+  ошибки демодуляции как символьные; `t` ошибок исправляются, `t+1` дают **явный отказ**
+  (важно для ARQ). Блочный интерливер разносит широкий всплеск по кодовым словам.
+- **Заголовок кадра всегда робастный и mode-agnostic** → приёмник узнаёт длину/режим до
+  чтения payload (OFDM «не гадает» длину). На этом стоит однозначный auto-fallback.
+
+## Запуск
+
+```bash
+npm install
+
+# Десктоп (Windows/Linux/macOS)
+npm run tauri dev
+
+# Android (нужен настроенный Android SDK/NDK; см. CI)
+npm run tauri android dev
+```
+
+Демонстрация мессенджера: запустить на **двух** устройствах рядом, на одном выбрать
+роль **A**, на другом **B**, «Запустить сессию», печатать сообщения. `Auto` пробует
+OFDM и откатывается на CSS при помехах; `CSS`/`OFDM` — принудительный режим.
+
+## Тесты и метрики
+
+```bash
+# Юнит-тесты DSP/протокола + аудио-пайплайна (без звукового железа):
+cargo test -p sonic-protocol -p sonic-audio
+
+# Свип BER/throughput по SNR (доказательство эффективности/устойчивости для жюри):
+cargo run --release --example ber_sweep -p sonic-protocol
+```
+
+62 теста в workspace: round-trip framing/FEC, коррекция `t` и детект `t+1` ошибок RS,
+BER-свипы CSS/OFDM по AWGN, OFDM под многолучёвостью в пределах CP, ARQ (потери/дедуп/
+fallback), сквозной прогон сообщения через симканал, TX→RX через реальный пайплайн.
+
+## Что реализовано и что отложено (честно)
+
+**Реализовано и протестировано:** FDD-план спектра; CSS-модем; OFDM+QAM (QPSK/16-QAM)
+с Schmidl-Cox, оценкой канала и эквалайзером; framing + CRC; Reed-Solomon + интерливер;
+ARQ (окно, selective-repeat, ACK/SACK, ретрансмиссии, backoff, LINK_DOWN); auto-fallback;
+симканал (AWGN/multipath/clock-drift); cpal duplex-движок и пайплайн; интеграция Tauri
+(команды/события/состояние); чат-UI с телеметрией; сохранены самопроверка канала и
+акустическое обнаружение устройств.
+
+**Осознанно отложено (не скрытые заглушки — явные решения, отмечены в коде):**
+
+- **Session-уровень: Noise_XX handshake, ChaCha20-шифрование, SAS** (PROTOCOL.md §8) —
+  сейчас сообщения идут открыто. Это отдельная крипто-поверхность; в plan.md идёт как
+  поздняя фаза. Место стыковки — `session.rs` (перед FEC).
+- **64-QAM** — реализованы QPSK и 16-QAM; ступень 64-QAM в лестнице режимов есть в
+  auto-fallback, но модем её пока не кодирует.
+- **NLMS-AEC / общая полоса** (plan.md Фаза 8) — шов готов (`EchoCanceller`,
+  reference-отвод), реализация — no-op (для FDD не нужна).
+- **Ультразвуковой профиль + ESP32** (plan.md Фаза 7) — параметры полосы есть, отдельный
+  embedded-трек не начат; в UI профиль отключён.
+- **Реальная эфирная проверка между устройствами и на Android** — DSP проверен в
+  симуляции (BER-свип, сквозные тесты, TX→RX через пайплайн), но прогон «по воздуху» на
+  двух физических устройствах и на Android — ручной шаг (plan.md Фаза 2/4), в этой среде
+  не выполнялся. Производительность стримингового приёмника на длинных CSS-кадрах —
+  область тюнинга (инкрементальная даунконверсия, Фаза 2/6).

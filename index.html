@@ -1,70 +1,137 @@
 <!doctype html>
-<html lang="en">
+<html lang="ru">
   <head>
     <meta charset="UTF-8" />
     <link rel="stylesheet" href="/src/styles.css" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri App</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Sonic — акустический мессенджер</title>
     <script type="module" src="/src/main.ts" defer></script>
   </head>
 
   <body>
-    <main class="container">
-      <h1>Welcome to Tauri</h1>
-
-      <div class="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/src/assets/vite.svg" class="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img
-            src="/src/assets/tauri.svg"
-            class="logo tauri"
-            alt="Tauri logo"
-          />
-        </a>
-        <a href="https://www.typescriptlang.org/docs" target="_blank">
-          <img
-            src="/src/assets/typescript.svg"
-            class="logo typescript"
-            alt="typescript logo"
-          />
-        </a>
-      </div>
-      <p>Click on the Tauri logo to learn more about the framework</p>
-
-      <form class="row" id="greet-form">
-        <input id="greet-input" placeholder="Enter a name..." />
-        <button type="submit">Greet</button>
-      </form>
-      <p id="greet-msg"></p>
-
-      <section class="channel-check">
-        <h2>Проверка канала (это устройство)</h2>
-        <p class="channel-check-hint">
-          На ~2 секунды нужна тишина, затем колонки проиграют короткий тестовый сигнал —
-          не закрывайте микрофон.
-        </p>
-        <button id="check-channel-btn" type="button">Проверить канал</button>
-        <p id="channel-status" class="channel-status"></p>
-        <div id="channel-result" class="channel-result"></div>
-      </section>
-
-      <section class="channel-check channel-check-wide">
-        <h2>Обнаружение устройств (по звуку)</h2>
-        <p class="channel-check-hint">
-          Без Wi-Fi/сети — устройство слушает и проигрывает свой никнейм через динамик.
-          Запустите на нескольких устройствах рядом друг с другом (ПК↔ПК, телефон↔телефон,
-          ПК↔телефон) — каждое услышанное устройство появится в списке ниже вместе с
-          качеством приёма (~20 c на весь поиск).
-        </p>
-        <div class="row-2p">
-          <input id="nickname-input" placeholder="Ваш никнейм, напр. ALEX-PC" maxlength="6" />
-          <button id="discover-btn" type="button">Найти устройства</button>
+    <main id="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-dot"></span>
+          <div class="brand-text">
+            <h1>Sonic</h1>
+            <p class="tagline">Full-duplex акустический мессенджер · ADL/1</p>
+          </div>
         </div>
-        <p id="discovery-status" class="channel-status"></p>
-        <ul id="discovery-list" class="discovery-list"></ul>
+        <div id="session-badge" class="session-badge off">офлайн</div>
+      </header>
+
+      <!-- Настройка сессии -->
+      <section id="setup" class="card">
+        <h2>Начать сессию</h2>
+        <p class="hint">
+          Передача данных звуком без сети (FDD): одна сторона — <b>A</b> (нижняя полоса),
+          другая — <b>B</b> (верхняя). Запустите на двух устройствах рядом и выберите
+          <b>разные</b> роли.
+        </p>
+
+        <div class="field">
+          <label>Роль</label>
+          <div class="segmented" id="role-seg">
+            <button type="button" data-role="initiator" class="active">A · инициатор</button>
+            <button type="button" data-role="responder">B · респондер</button>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Профиль</label>
+          <div class="segmented" id="profile-seg">
+            <button type="button" data-profile="audible" class="active">Слышимый · 0.5–15 кГц</button>
+            <button type="button" data-profile="ultrasonic" disabled title="Требует ESP32-железа (Фаза 7)">
+              Ультразвук · 21–24 кГц
+            </button>
+          </div>
+        </div>
+
+        <button id="start-btn" class="primary block">Запустить сессию</button>
+        <p id="setup-error" class="error"></p>
       </section>
+
+      <!-- Чат -->
+      <section id="chat" class="card chat hidden">
+        <div class="telemetry" id="telemetry">
+          <div class="tele-item">
+            <span class="tele-label">Режим</span>
+            <span class="tele-value mode-badge" id="tele-mode">—</span>
+          </div>
+          <div class="tele-item">
+            <span class="tele-label">SNR</span>
+            <span class="tele-value" id="tele-snr">— дБ</span>
+          </div>
+          <div class="tele-item">
+            <span class="tele-label">RTT</span>
+            <span class="tele-value" id="tele-rtt">— мс</span>
+          </div>
+          <div class="tele-item">
+            <span class="tele-label">Ретраи</span>
+            <span class="tele-value" id="tele-retx">0</span>
+          </div>
+          <div class="tele-item">
+            <span class="tele-label">PER</span>
+            <span class="tele-value" id="tele-per">0%</span>
+          </div>
+          <div class="tele-item">
+            <span class="tele-label">В окне</span>
+            <span class="tele-value" id="tele-inflight">0</span>
+          </div>
+        </div>
+
+        <div class="messages" id="messages">
+          <div class="empty-hint" id="empty-hint">
+            Сообщения пойдут звуком. CSS надёжный, но медленный (~50 бит/с); OFDM быстрее.
+            Auto сам откатывается на CSS при помехах.
+          </div>
+        </div>
+
+        <form id="composer" class="composer">
+          <input id="msg-input" placeholder="Сообщение…" autocomplete="off" maxlength="500" />
+          <button type="submit" class="primary send" title="Отправить">▶</button>
+        </form>
+
+        <div class="chat-controls">
+          <div class="segmented small" id="mode-seg">
+            <button type="button" data-mode="auto" class="active">Auto</button>
+            <button type="button" data-mode="css">CSS</button>
+            <button type="button" data-mode="ofdm">OFDM</button>
+          </div>
+          <button id="stop-btn" class="ghost">Завершить</button>
+        </div>
+      </section>
+
+      <!-- Инструменты канала (самопроверка + акустическое обнаружение) -->
+      <details class="card tools">
+        <summary>Инструменты канала</summary>
+
+        <div class="tool-block">
+          <h3>Проверка канала (это устройство)</h3>
+          <p class="hint">
+            ~2 секунды тишины, затем колонки проиграют тестовый сигнал — не закрывайте
+            микрофон. Оценка SNR и рекомендация режима.
+          </p>
+          <button id="check-channel-btn" type="button" class="block">Проверить канал</button>
+          <p id="channel-status" class="channel-status"></p>
+          <div id="channel-result" class="channel-result"></div>
+        </div>
+
+        <div class="tool-block">
+          <h3>Обнаружение устройств (по звуку)</h3>
+          <p class="hint">
+            Без сети — устройство слушает и проигрывает свой никнейм. Запустите на
+            нескольких устройствах рядом (~20 c на поиск).
+          </p>
+          <div class="row-2p">
+            <input id="nickname-input" placeholder="Никнейм, напр. ALEX" maxlength="6" />
+            <button id="discover-btn" type="button">Найти устройства</button>
+          </div>
+          <p id="discovery-status" class="channel-status"></p>
+          <ul id="discovery-list" class="discovery-list"></ul>
+        </div>
+      </details>
     </main>
   </body>
 </html>

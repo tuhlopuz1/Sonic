@@ -12,6 +12,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Юнит-тесты DSP/протокольного ядра (sonic-protocol) и аудио-пайплайна (sonic-audio)
+  # без Android SDK/GUI и без звукового устройства (реально-аудио тесты за feature-флагом).
+  # Полная сборка Tauri-приложения проверяется в health-check-* ниже.
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> src-tauri/target
+
+      - name: Install ALSA dev headers (cpal build dep for sonic-audio)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Run DSP/protocol unit tests
+        run: cargo test -p sonic-protocol -p sonic-audio --locked
+
   health-check-desktop:
     strategy:
       fail-fast: false
@@ -48,7 +68,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri -> target
+          workspaces: . -> src-tauri/target
 
       - run: npm ci
 
@@ -128,7 +148,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri -> target
+          workspaces: . -> src-tauri/target
 
       - uses: actions/setup-java@v4
         with:
