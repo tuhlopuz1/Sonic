@@ -57,6 +57,13 @@ pub fn spawn(app: AppHandle) {
                     }
                     Err(e) => eprintln!("audio_watch: не удалось перечислить устройства: {e}"),
                 }
+                // На Android опрос бессмыслен и дорог: cpal отдаёт одно устройство по
+                // умолчанию (списка для hot-plug там просто нет), а каждое перечисление —
+                // это сотни JNI-вызовов, потому что cpal перебирает форматы и частоты
+                // через `AudioRecord.getMinBufferSize`. Отдаём стартовый снимок и выходим.
+                if cfg!(target_os = "android") {
+                    return;
+                }
                 std::thread::sleep(POLL_INTERVAL);
             }
         });

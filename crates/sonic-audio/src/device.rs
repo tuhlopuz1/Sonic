@@ -23,7 +23,23 @@ pub struct DeviceList {
     pub default_output: Option<String>,
 }
 
+/// Ловушка паник на границе с cpal.
+///
+/// Backend cpal под Android (Oboe) ходит в Java-API и щедро сыпет `.unwrap()` внутри
+/// JNI-вызовов: любой отказ (нет контекста, устройство занято, прошивка вернула
+/// неожиданное) — не `Err`, а паника. Синхронная tauri-команда выполняется прямо в
+/// JNI-кадре, и такая паника разворачивается через границу FFI, то есть убивает процесс.
+/// Здесь она превращается в обычную ошибку, которую UI покажет текстом.
+fn guard<T>(what: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or_else(|_| Err(format!("Аудио-подсистема упала при обращении к {what}")))
+}
+
 pub fn list_devices() -> Result<DeviceList, String> {
+    guard("списку устройств", list_devices_inner)
+}
+
+fn list_devices_inner() -> Result<DeviceList, String> {
     let host = cpal::default_host();
     let mut list = DeviceList::default();
 
@@ -113,6 +129,13 @@ pub fn open_input(
     target_rate: u32,
     name: Option<&str>,
 ) -> Result<(Device, SupportedStreamConfig), String> {
+    guard("микрофону", || open_input_inner(target_rate, name))
+}
+
+fn open_input_inner(
+    target_rate: u32,
+    name: Option<&str>,
+) -> Result<(Device, SupportedStreamConfig), String> {
     let host = cpal::default_host();
     let device = resolve_device(
         host.input_devices().ok(),
@@ -135,6 +158,13 @@ pub fn open_input(
 
 /// То же для динамика.
 pub fn open_output(
+    target_rate: u32,
+    name: Option<&str>,
+) -> Result<(Device, SupportedStreamConfig), String> {
+    guard("динамику", || open_output_inner(target_rate, name))
+}
+
+fn open_output_inner(
     target_rate: u32,
     name: Option<&str>,
 ) -> Result<(Device, SupportedStreamConfig), String> {
