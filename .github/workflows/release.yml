@@ -1,9 +1,12 @@
 name: Release
 
 on:
-  push:
-    branches: [master]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version in SemVer format (for example, 0.2.7)"
+        required: true
+        type: string
 
 concurrency:
   group: release
@@ -14,9 +17,6 @@ permissions:
 
 jobs:
   prepare:
-    # Push events still need "[release]" in the commit message; a manual "Run workflow"
-    # click from the Actions tab is already an explicit request, no tag needed for that.
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[release]')
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -27,35 +27,22 @@ jobs:
         with:
           fetch-depth: 0
 
-      # If src-tauri/tauri.conf.json's version is already tagged (forgot to bump it
-      # before pushing with [release]), auto-bump the patch number until we find one
-      # that isn't tagged yet, and commit that bump back to master ourselves — so
-      # a forgotten bump never blocks the release, only delays it by one patch.
-      - name: Auto-bump version if already released
+      # The version comes from the manual dispatch input. CI never modifies master:
+      # it only creates a release tag after every build succeeds.
+      - name: Validate release version and reserve tag
         id: version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          CURRENT=$(jq -r .version src-tauri/tauri.conf.json)
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-          VERSION="$CURRENT"
-          while git ls-remote --tags origin | grep -q "refs/tags/v${VERSION}$"; do
-            PATCH=$((PATCH + 1))
-            VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          done
-
-          if [ "$VERSION" != "$CURRENT" ]; then
-            echo "v$CURRENT is already released, bumping to v$VERSION"
-            for FILE in package.json src-tauri/tauri.conf.json; do
-              jq --arg v "$VERSION" '.version = $v' "$FILE" > "$FILE.tmp"
-              mv "$FILE.tmp" "$FILE"
-            done
-            sed -i "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
-
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
-            git commit -m "chore: bump version to $VERSION (auto, previous version already released)"
-            git push origin HEAD:master
+          VERSION="$RELEASE_VERSION"
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "::error::Version must be valid SemVer, e.g. 0.2.7 or 0.2.7-rc.1"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null; then
+            echo "::error::Tag v${VERSION} already exists"
+            exit 1
           fi
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -104,8 +91,13 @@ jobs:
 
       - run: npm ci
 
+      - name: Create temporary release config
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: node -e "require('fs').writeFileSync('tauri-release.conf.json', JSON.stringify({ version: process.env.RELEASE_VERSION }))"
+
       - name: Build app bundles
-        run: npm run tauri build
+        run: npm run tauri build -- --config tauri-release.conf.json
 
       - name: Upload bundles
         uses: actions/upload-artifact@v4
@@ -157,6 +149,11 @@ jobs:
 
       - run: npm ci
 
+      - name: Create temporary release config
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: node -e "require('fs').writeFileSync('tauri-release.conf.json', JSON.stringify({ version: process.env.RELEASE_VERSION }))"
+
       # Populates src-tauri/gen/android/keystore.properties (gitignored) from repo
       # secrets, which app/build.gradle.kts picks up automatically for release signing.
       # Missing secrets are a hard failure on purpose: without them Gradle silently falls
@@ -194,10 +191,10 @@ jobs:
       # Второй прогон почти бесплатный: Rust-артефакты для всех четырёх целей уже собраны
       # первым, повторяется только Gradle.
       - name: Build universal release APK
-        run: npm run tauri android build -- --apk
+        run: npm run tauri android build -- --apk --config tauri-release.conf.json
 
       - name: Build per-ABI release APKs
-        run: npm run tauri android build -- --split-per-abi --apk
+        run: npm run tauri android build -- --split-per-abi --apk --config tauri-release.conf.json
 
       # Имена от Gradle (app-arm64-release.apk) ничего не говорят тому, кто пришёл на
       # страницу релиза скачать приложение, — переименовываем в ABI, который реально
@@ -268,6 +265,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ needs.prepare.outputs.sha }}
           name: ${{ needs.prepare.outputs.tag }}
           generate_release_notes: true
           files: artifacts/**/*
