@@ -4,6 +4,10 @@ version.workspace = true
 description = "Sonic — full-duplex акустический мессенджер"
 authors.workspace = true
 edition.workspace = true
+version = "0.2.3"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
