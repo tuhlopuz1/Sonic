@@ -116,6 +116,23 @@ pub fn check_channel(
     crate::channel_check::check_channel(&selection(input_device, output_device))
 }
 
+/// Loopback-самотест модема на одном устройстве: играет кадр в динамик, пишет
+/// микрофоном, пробует декодировать. Показывает, работает ли DSP через реальный звук.
+#[tauri::command]
+pub fn modem_self_test(
+    mode: String,
+    input_device: Option<String>,
+    output_device: Option<String>,
+) -> Result<crate::self_test::SelfTestReport, String> {
+    let mode = match mode.to_ascii_lowercase().as_str() {
+        "css" => sonic_protocol::framing::PhyMode::Css,
+        "ofdm" | "ofdm-qpsk" | "qpsk" => sonic_protocol::framing::PhyMode::OfdmQpsk,
+        "ofdm-16qam" | "16qam" => sonic_protocol::framing::PhyMode::Ofdm16Qam,
+        other => return Err(format!("Неизвестный режим: {other}")),
+    };
+    crate::self_test::run(mode, &selection(input_device, output_device))
+}
+
 /// Акустическое обнаружение устройств поблизости — тоже на выбранных устройствах.
 #[tauri::command]
 pub fn discover_devices(

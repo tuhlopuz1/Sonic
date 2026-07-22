@@ -122,6 +122,21 @@
         <p class="hint devices-hint" id="tools-devices"></p>
 
         <div class="tool-block">
+          <h3>Самотест модема (одно устройство)</h3>
+          <p class="hint">
+            Проигрывает кадр в динамик и тут же слушает микрофоном — проверяет, работает ли
+            передача через реальный звук на этом устройстве. Прибавьте громкость и не
+            заглушайте микрофон.
+          </p>
+          <div class="row-2p">
+            <button id="selftest-css" type="button">Тест CSS</button>
+            <button id="selftest-ofdm" type="button">Тест OFDM</button>
+          </div>
+          <p id="selftest-status" class="channel-status"></p>
+          <div id="selftest-result" class="channel-result"></div>
+        </div>
+
+        <div class="tool-block">
           <h3>Проверка канала (это устройство)</h3>
           <p class="hint">
             ~2 секунды тишины, затем колонки проиграют тестовый сигнал — не закрывайте

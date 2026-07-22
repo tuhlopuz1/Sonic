@@ -7,6 +7,7 @@ mod channel_check;
 mod commands;
 mod discovery;
 mod events;
+mod self_test;
 mod session;
 mod state;
 
@@ -29,6 +30,7 @@ pub fn run() {
             commands::send_message,
             commands::set_mode,
             commands::list_audio_devices,
+            commands::modem_self_test,
             // Самопроверка канала и акустическое обнаружение устройств
             commands::check_channel,
             commands::discover_devices,

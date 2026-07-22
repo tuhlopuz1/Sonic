@@ -46,6 +46,14 @@ pub struct RxDemodulator {
     reference: std::collections::VecDeque<f32>,
     max_buf: usize,
     min_attempt: usize,
+    sample_rate: usize,
+    /// Адаптивный шумовой пол (EWMA RMS) — гейт считается относительно него, а не по
+    /// фиксированному порогу, иначе тихий захват микрофона блокируется навсегда.
+    noise_rms: f32,
+    /// Троттлинг тяжёлой демодуляции: сколько новых сэмплов накоплено с прошлой попытки.
+    since_attempt: usize,
+    /// Троттлинг диагностического лога уровня захвата.
+    since_log: usize,
 }
 
 impl RxDemodulator {
@@ -67,6 +75,10 @@ impl RxDemodulator {
             reference: std::collections::VecDeque::new(),
             max_buf: max_frame * 2,
             min_attempt: sr as usize / 8, // не пытаться, пока нет хотя бы ~125 мс
+            sample_rate: sr as usize,
+            noise_rms: 0.0,
+            since_attempt: 0,
+            since_log: 0,
         }
     }
 
@@ -91,16 +103,60 @@ impl RxDemodulator {
         }
         self.canceller.process(&mut block, &refs);
         self.buf.extend_from_slice(&block);
+        self.since_attempt += block.len();
+        self.since_log += block.len();
     }
 
-    /// Пытается извлечь готовые кадры из буфера. Демодуляция — только при наличии энергии.
+    /// Уровень (RMS) последнего ~0.25 c буфера.
+    fn recent_rms(&self) -> f32 {
+        let win = (self.sample_rate / 4).max(1).min(self.buf.len());
+        if win == 0 {
+            return 0.0;
+        }
+        let tail = &self.buf[self.buf.len() - win..];
+        (tail.iter().map(|x| x * x).sum::<f32>() / win as f32).sqrt()
+    }
+
+    /// Пытается извлечь готовые кадры из буфера. Тяжёлая демодуляция запускается только
+    /// при наличии энергии (относительно адаптивного шумового пола) и не чаще, чем раз в
+    /// ~100 мс накопленного аудио — иначе на длинном CSS-кадре демод по всему буферу
+    /// каждые 5 мс пожирает CPU.
     pub fn poll(&mut self) -> Vec<RxEvent> {
         let mut out = Vec::new();
+        let recent = self.recent_rms();
+
+        // Диагностика раз в ~секунду: видно, слышит ли микрофон хоть что-то.
+        if self.since_log >= self.sample_rate {
+            self.since_log = 0;
+            eprintln!(
+                "sonic-rx: уровень захвата rms={recent:.4} (шумовой пол {:.4}, буфер {} c)",
+                self.noise_rms,
+                self.buf.len() / self.sample_rate.max(1)
+            );
+        }
+
+        // Порог: заметно выше шумового пола, но с низким абсолютным минимумом (тихий
+        // микрофон не должен блокироваться навсегда).
+        let gate = (self.noise_rms * 3.0).max(0.004);
+        let has_signal = recent > gate;
+        if !has_signal {
+            // Тишина/шум — медленно обновляем оценку шумового пола и не демодулируем.
+            self.noise_rms = if self.noise_rms == 0.0 {
+                recent
+            } else {
+                0.95 * self.noise_rms + 0.05 * recent
+            };
+            self.trim_if_needed();
+            return out;
+        }
+
+        // Троттлинг: не запускать демод чаще, чем раз в ~100 мс нового аудио.
+        if self.buf.len() < self.min_attempt || self.since_attempt < self.sample_rate / 10 {
+            return out;
+        }
+        self.since_attempt = 0;
+
         loop {
-            if self.buf.len() < self.min_attempt || !has_energy(&self.buf) {
-                self.trim_if_needed();
-                break;
-            }
             let mut found: Option<(RxEvent, usize)> = None;
             for m in &self.modems {
                 if let Some(d) = m.demodulate(&self.buf) {
@@ -117,6 +173,12 @@ impl RxDemodulator {
             }
             match found {
                 Some((ev, end)) => {
+                    eprintln!(
+                        "sonic-rx: поймал кадр {:?}, {} байт, SNR {:.1} дБ",
+                        ev.mode,
+                        ev.bytes.len(),
+                        ev.snr_db
+                    );
                     out.push(ev);
                     let end = end.min(self.buf.len());
                     self.buf.drain(0..end);
@@ -167,13 +229,6 @@ impl Transmitter {
             PhyMode::Ofdm16Qam => self.ofdm_16.modulate(frame_bytes),
         }
     }
-}
-
-/// Есть ли в буфере энергия выше уровня тишины (дешёвый гейт перед дорогой демодуляцией).
-fn has_energy(buf: &[f32]) -> bool {
-    // Пик по последнему участку — сигналы модема заметно громче фонового шума мембраны.
-    let tail = &buf[buf.len().saturating_sub(buf.len().min(24_000))..];
-    tail.iter().fold(0.0f32, |a, &s| a.max(s.abs())) > 0.02
 }
 
 #[cfg(test)]

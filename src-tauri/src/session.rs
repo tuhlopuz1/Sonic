@@ -209,7 +209,9 @@ fn session_loop(
         while let Ok(ev) = evt_rx.try_recv() {
             let frame = match Frame::parse(&ev.bytes) {
                 Ok(f) => f,
-                Err(_) => {
+                Err(e) => {
+                    // Кадр пойман модемом, но CRC/структура не сошлись — обычно низкий SNR.
+                    eprintln!("sonic-session: битый кадр ({e:?}), {} байт", ev.bytes.len());
                     link.frames_bad += 1;
                     continue;
                 }
@@ -218,6 +220,10 @@ fn session_loop(
             if frame.header.direction == my_dir {
                 continue;
             }
+            eprintln!(
+                "sonic-session: кадр {:?} seq={} от пира (SNR {:.1} дБ)",
+                frame.header.frame_type, frame.header.seq, ev.snr_db
+            );
             link.frames_ok += 1;
             link.snr_db = ev.snr_db;
 

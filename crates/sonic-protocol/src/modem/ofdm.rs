@@ -46,7 +46,6 @@ pub struct OfdmModem {
     /// Известные пилотные значения (выровнены с `pilot_bins`).
     pilot_values: Vec<Complex32>,
     fft: FftEngine,
-    out_gain: f32,
 }
 
 impl OfdmModem {
@@ -82,10 +81,6 @@ impl OfdmModem {
         let pilot_values: Vec<Complex32> =
             pilot_bins.iter().map(|&b| pn_qpsk(b as u64 ^ 0xA3)).collect();
 
-        // Нормируем выход по амплитуде (у OFDM высокий PAPR); константа поглощается
-        // эквалайзером, т.к. H оценивается по тому же усилению.
-        let out_gain = 0.25 * (N as f32).sqrt() / (active.len() as f32).sqrt();
-
         OfdmModem {
             center_hz: band.center_hz,
             sample_rate: sr,
@@ -97,7 +92,6 @@ impl OfdmModem {
             ce_values,
             pilot_values,
             fft: FftEngine::new(N),
-            out_gain,
         }
     }
 
@@ -193,10 +187,6 @@ impl Modem for OfdmModem {
             bb.extend(self.assemble_data_symbol(&syms));
         }
 
-        for x in bb.iter_mut() {
-            *x *= self.out_gain;
-        }
-
         // Циклический постфикс: продолжаем последний символ его же началом (IFFT-выход
         // периодичен) — гладкий «хвост» под fade-out, который не трогает полезные данные.
         let ramp = (self.sample_rate * 0.003) as usize;
@@ -207,6 +197,12 @@ impl Modem for OfdmModem {
         }
 
         let mut passband = upconvert(&bb, self.sample_rate, self.center_hz, 0);
+        // У OFDM высокий пик-фактор (~19 дБ), поэтому теоретическая калибровка усиления
+        // давала сигнал в ~130 раз тише CSS — по воздуху он тонул в шуме. Нормируем по
+        // факту: масштаб до целевого RMS + мягкое ограничение пиков (tanh), чтобы сигнал
+        // был громким, но не клиппился. Общий масштаб поглощается эквалайзером на приёме
+        // (H оценивается по CE-символу с тем же усилением), декодирование не страдает.
+        normalize_loud(&mut passband);
         edge_ramp(&mut passband, ramp);
         passband
     }
@@ -417,6 +413,25 @@ fn evm_snr_db(syms: &[Complex32], modulation: Modulation) -> f32 {
         return 40.0;
     }
     (10.0 * (sig / err).log10()).clamp(-10.0, 40.0)
+}
+
+/// Потолок амплитуды (запас до клиппинга ЦАП).
+const CEILING: f32 = 0.9;
+
+/// Пиковая нормализация: масштаб так, чтобы максимум по модулю равнялся `CEILING`.
+/// БЕЗ ограничения/искажений — иначе плотное созвездие 16-QAM ломается даже в чистом
+/// канале. У OFDM PAPR ~19 дБ, поэтому RMS выходит ~0.1 (примерно в 18 раз громче
+/// прежней сломанной калибровки, но всё ещё тише CSS — это плата за высокий пик-фактор
+/// без клиппинга). Общий масштаб поглощается эквалайзером на приёме.
+fn normalize_loud(signal: &mut [f32]) {
+    let peak = signal.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
+    if peak < 1e-9 {
+        return;
+    }
+    let gain = CEILING / peak;
+    for x in signal.iter_mut() {
+        *x *= gain;
+    }
 }
 
 fn edge_ramp(signal: &mut [f32], ramp: usize) {

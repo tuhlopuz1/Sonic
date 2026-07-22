@@ -457,8 +457,52 @@ async function discoverDevices() {
   }
 }
 
+interface SelfTestReport {
+  mode: string;
+  detected: boolean;
+  matched: boolean;
+  snr_db: number;
+  captured_peak: number;
+  captured_rms: number;
+  verdict: string;
+}
+
+async function runSelfTest(mode: "css" | "ofdm") {
+  const statusEl = $("#selftest-status");
+  const resultEl = $("#selftest-result");
+  const cssBtn = $<HTMLButtonElement>("#selftest-css");
+  const ofdmBtn = $<HTMLButtonElement>("#selftest-ofdm");
+  if (!statusEl || !resultEl) return;
+  if (cssBtn) cssBtn.disabled = true;
+  if (ofdmBtn) ofdmBtn.disabled = true;
+  resultEl.innerHTML = "";
+  statusEl.textContent = "Играем кадр и слушаем микрофон (~1–2 с)…";
+  try {
+    const r = await invoke<SelfTestReport>("modem_self_test", { mode, ...currentDevices() });
+    statusEl.textContent = "Готово";
+    const icon = r.matched ? "✅" : r.detected ? "⚠️" : "❌";
+    resultEl.innerHTML = `
+      <div class="mode-badge big ${r.matched ? "mode-64qam" : r.detected ? "mode-16qam" : "mode-css"}">
+        <div class="mode-name">${icon} ${r.mode}: ${r.matched ? "работает" : r.detected ? "ловится с ошибками" : "не декодировано"}</div>
+        <div class="mode-rate">${r.verdict}</div>
+      </div>
+      <div class="channel-metrics">
+        <div class="metric"><span class="metric-label">Уровень захвата (пик)</span><span class="metric-value">${r.captured_peak.toFixed(3)}</span></div>
+        <div class="metric"><span class="metric-label">RMS</span><span class="metric-value">${r.captured_rms.toFixed(4)}</span></div>
+        <div class="metric"><span class="metric-label">SNR</span><span class="metric-value">${r.detected ? r.snr_db.toFixed(1) + " дБ" : "—"}</span></div>
+      </div>`;
+  } catch (err) {
+    statusEl.textContent = `Ошибка: ${err}`;
+  } finally {
+    if (cssBtn) cssBtn.disabled = false;
+    if (ofdmBtn) ofdmBtn.disabled = false;
+  }
+}
+
 function wireTools() {
   $("#check-channel-btn")?.addEventListener("click", checkChannel);
+  $("#selftest-css")?.addEventListener("click", () => runSelfTest("css"));
+  $("#selftest-ofdm")?.addEventListener("click", () => runSelfTest("ofdm"));
   const nicknameInput = $<HTMLInputElement>("#nickname-input");
   if (nicknameInput) nicknameInput.value = loadOrCreateNickname();
   $("#discover-btn")?.addEventListener("click", discoverDevices);
