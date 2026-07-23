@@ -12,7 +12,7 @@
 //! микрофон → канон на входе, канон → динамик на выходе.
 
 use crate::device::io_config;
-use crate::pipeline::{RxDemodulator, RxEvent, Transmitter};
+use crate::pipeline::{RxDemodulator, RxEvent, RxStats, Transmitter};
 use crate::resample::Resampler;
 use crate::streams::{build_input_stream, build_output_stream};
 use cpal::traits::StreamTrait;
@@ -39,7 +39,16 @@ enum EngineCommand {
     Stop,
 }
 
-/// `Send`-хендл движка: канал команд + join. События приёма идут в переданный `evt_tx`.
+/// Отладочный снимок аудио-тракта для UI: уровни приёмника + идёт ли сейчас своя передача.
+#[derive(Debug, Clone, Copy)]
+pub struct EngineDebug {
+    pub rx: RxStats,
+    /// Приёмник заглушён своей передачей (полудуплекс).
+    pub tx_active: bool,
+}
+
+/// `Send`-хендл движка: канал команд + join. События приёма идут в переданный `evt_tx`,
+/// периодические отладочные снимки уровней — в `debug_tx`.
 pub struct DuplexEngine {
     cmd_tx: Sender<EngineCommand>,
     handle: Option<JoinHandle<()>>,
@@ -49,13 +58,17 @@ pub struct DuplexEngine {
 
 impl DuplexEngine {
     /// Запускает дуплекс. Ошибки открытия устройств прокидываются синхронно.
-    pub fn start(cfg: EngineConfig, evt_tx: Sender<RxEvent>) -> Result<DuplexEngine, String> {
+    pub fn start(
+        cfg: EngineConfig,
+        evt_tx: Sender<RxEvent>,
+        debug_tx: Sender<EngineDebug>,
+    ) -> Result<DuplexEngine, String> {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let (init_tx, init_rx) = mpsc::channel::<Result<u32, String>>();
 
         let handle = std::thread::Builder::new()
             .name("sonic-audio-duplex".into())
-            .spawn(move || run_engine(cfg, cmd_rx, evt_tx, init_tx))
+            .spawn(move || run_engine(cfg, cmd_rx, evt_tx, debug_tx, init_tx))
             .map_err(|e| format!("spawn audio thread: {e}"))?;
 
         match init_rx.recv() {
@@ -93,6 +106,7 @@ fn run_engine(
     cfg: EngineConfig,
     cmd_rx: Receiver<EngineCommand>,
     evt_tx: Sender<RxEvent>,
+    debug_tx: Sender<EngineDebug>,
     init_tx: mpsc::Sender<Result<u32, String>>,
 ) {
     let scheme = Tdd::new(cfg.role, cfg.profile);
@@ -170,6 +184,7 @@ fn run_engine(
     const TX_TAIL: Duration = Duration::from_millis(220);
     let mut tx_busy_until = Instant::now();
     let mut was_gated = false;
+    let mut last_debug = Instant::now();
 
     let mut raw = Vec::with_capacity(8192);
     let mut resampled = Vec::with_capacity(8192);
@@ -226,6 +241,15 @@ fn run_engine(
                     break;
                 }
             }
+        }
+
+        // 3b. Периодический отладочный снимок уровней в UI (раз в ~200 мс).
+        if last_debug.elapsed() >= Duration::from_millis(200) {
+            last_debug = Instant::now();
+            let _ = debug_tx.send(EngineDebug {
+                rx: rx.stats(),
+                tx_active,
+            });
         }
 
         // 4. Скармливаем исходящие сэмплы в кольцо динамика.

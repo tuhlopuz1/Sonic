@@ -142,6 +142,33 @@
           <div id="mascot-status" class="mascot-status">Связь не запущена</div>
         </section>
 
+        <!-- Живая аудио-диагностика: что реально слышит микрофон -->
+        <details class="rx-debug" id="rx-debug">
+          <summary>🎧 Что слышит микрофон</summary>
+          <div class="rx-meter">
+            <div class="rx-bar-track">
+              <div class="rx-bar-fill" id="rx-bar"></div>
+              <div class="rx-gate-line" id="rx-gate-line" title="порог детекции"></div>
+              <div class="rx-peak-line" id="rx-peak-line" title="пик"></div>
+            </div>
+            <span class="rx-badge" id="rx-state">ожидание</span>
+          </div>
+          <div class="rx-stats">
+            <span>RMS <b id="rx-rms">—</b></span>
+            <span>пик <b id="rx-peak">—</b></span>
+            <span>шум <b id="rx-noise">—</b></span>
+            <span>гейт <b id="rx-gate">—</b></span>
+            <span>буфер <b id="rx-buf">—</b></span>
+            <span>кадры <b class="ok" id="rx-ok">0</b>/<b class="bad" id="rx-bad">0</b></span>
+            <span>SNR <b id="rx-snr">—</b></span>
+          </div>
+          <p class="rx-hint" id="rx-hint">
+            Зелёная полоса выше засечки-гейта = микрофон слышит кадр. Если полоса всегда ниже
+            гейта — прибавьте громкость / сдвиньте устройства. Если ✗ растёт — сигнал ловится, но
+            слишком шумно.
+          </p>
+        </details>
+
         <!-- Управление активной сессией (появляется при подключении) -->
         <div id="chat" class="control-section hidden">
           <section class="panel">

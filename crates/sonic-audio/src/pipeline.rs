@@ -28,6 +28,29 @@ pub struct RxEvent {
     pub mode: PhyMode,
 }
 
+/// Живой снимок состояния приёмника для отладки/визуализации в UI (уровни, гейт, счётчики).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RxStats {
+    /// RMS хвоста (~125 мс) — «громкость» того, что микрофон слышит сейчас.
+    pub rms: f32,
+    /// Пиковая амплитуда хвоста.
+    pub peak: f32,
+    /// Оценённый шумовой пол.
+    pub noise_floor: f32,
+    /// Порог детекции сигнала (выше него — «есть звук»).
+    pub gate: f32,
+    /// Длина накопленного буфера в секундах.
+    pub buffer_secs: f32,
+    /// Идёт ли сейчас всплеск (в буфере есть звук выше гейта).
+    pub in_burst: bool,
+    /// Успешно декодированных кадров (CRC ok).
+    pub frames_ok: u32,
+    /// Всплесков с пойманной синхронизацией, но битым CRC (низкий SNR).
+    pub frames_bad: u32,
+    /// SNR последнего успешного кадра.
+    pub last_snr_db: f32,
+}
+
 /// Строит полный набор демодуляторов для полосы (CSS + MFSK + оба OFDM) — приёмник
 /// mode-agnostic. У каждого свой sync-маркер, поэтому перекрёстных ложных срабатываний нет.
 fn build_modems(band: SubBand, sample_rate: u32) -> Vec<Box<dyn Modem>> {
@@ -40,22 +63,37 @@ fn build_modems(band: SubBand, sample_rate: u32) -> Vec<Box<dyn Modem>> {
 }
 
 /// Приёмный конвейер: копит захваченные сэмплы и выдаёт декодированные кадры.
+///
+/// **Сегментация по паузам (VAD-стиль).** Прежний конвейер копил ВЕСЬ звук в один растущий
+/// буфер и всегда пытался декодировать С НАЧАЛА — а там застревал ранний шум, на который
+/// синхронизация цеплялась один раз и падала; реальный кадр приходил позже и шанса не получал
+/// (буфер рос до секунд и не декодировался — ровно то, что видно в логе). В полудуплексе между
+/// кадрами ВСЕГДА пауза (stop-and-wait), поэтому здесь кадр = всплеск энергии, ограниченный
+/// тишиной: как только хвост стал тихим — демодулируем накопленный всплеск и очищаем буфер
+/// (успех или нет — ARQ переотправит). Так гарантирован forward progress и нет застрявшего
+/// префикса.
 pub struct RxDemodulator {
     modems: Vec<Box<dyn Modem>>,
     canceller: Box<dyn EchoCanceller>,
     buf: Vec<f32>,
     /// Кольцо reference-сэмплов (то, что мы воспроизводим) для эхоподавителя.
     reference: std::collections::VecDeque<f32>,
-    max_buf: usize,
-    min_attempt: usize,
+    /// Самый длинный ожидаемый кадр (CSS медленный) — предел буфера при непрерывной энергии.
+    max_frame: usize,
     sample_rate: usize,
-    /// Адаптивный шумовой пол (EWMA RMS) — гейт считается относительно него, а не по
-    /// фиксированному порогу, иначе тихий захват микрофона блокируется навсегда.
+    /// Оценка шумового пола: быстро вниз (садится к тишине), медленно вверх (всплеск не задирает).
     noise_rms: f32,
-    /// Троттлинг тяжёлой демодуляции: сколько новых сэмплов накоплено с прошлой попытки.
-    since_attempt: usize,
+    /// Троттлинг форс-демода очень длинного (непрерывно шумного) буфера.
+    since_force: usize,
     /// Троттлинг диагностического лога уровня захвата.
     since_log: usize,
+    // --- отладочные счётчики/уровни (для UI и логов) ---
+    stat_rms: f32,
+    stat_peak: f32,
+    stat_gate: f32,
+    frames_ok: u32,
+    frames_bad: u32,
+    last_snr_db: f32,
 }
 
 impl RxDemodulator {
@@ -64,7 +102,6 @@ impl RxDemodulator {
         let band = scheme.rx_band();
         let sr = scheme.sample_rate();
         let modems = build_modems(band, sr);
-        // Буфер должен вмещать самый длинный ожидаемый кадр (CSS медленный) с запасом.
         let max_frame = modems
             .iter()
             .map(|m| m.frame_samples(64))
@@ -75,23 +112,42 @@ impl RxDemodulator {
             canceller: scheme.echo_canceller(),
             buf: Vec::new(),
             reference: std::collections::VecDeque::new(),
-            max_buf: max_frame * 2,
-            min_attempt: sr as usize / 8, // не пытаться, пока нет хотя бы ~125 мс
+            max_frame,
             sample_rate: sr as usize,
             noise_rms: 0.0,
-            since_attempt: 0,
+            since_force: 0,
             since_log: 0,
+            stat_rms: 0.0,
+            stat_peak: 0.0,
+            stat_gate: 0.006,
+            frames_ok: 0,
+            frames_bad: 0,
+            last_snr_db: 0.0,
+        }
+    }
+
+    /// Живой снимок уровней/счётчиков для отладки в UI.
+    pub fn stats(&self) -> RxStats {
+        RxStats {
+            rms: self.stat_rms,
+            peak: self.stat_peak,
+            noise_floor: self.noise_rms,
+            gate: self.stat_gate,
+            buffer_secs: self.buf.len() as f32 / self.sample_rate.max(1) as f32,
+            in_burst: !self.buf.is_empty() && self.stat_rms > self.stat_gate,
+            frames_ok: self.frames_ok,
+            frames_bad: self.frames_bad,
+            last_snr_db: self.last_snr_db,
         }
     }
 
     /// Сбрасывает накопленный приёмный буфер и reference. Вызывается в полудуплексе при
     /// переходе «передача → приём»: за время своей передачи микрофон писал собственное эхо,
-    /// и его остатки нельзя скармливать демодулятору — иначе они «съедят» начало ответа пира.
-    /// Адаптивный шумовой пол намеренно СОХРАНЯЕТСЯ (это долгоживущая оценка среды).
+    /// и его остатки нельзя скармливать демодулятору. Шумовой пол/счётчики сохраняются.
     pub fn clear(&mut self) {
         self.buf.clear();
         self.reference.clear();
-        self.since_attempt = 0;
+        self.since_force = 0;
     }
 
     /// Кладёт воспроизводимые сэмплы в reference-кольцо (для AEC-шва).
@@ -99,8 +155,7 @@ impl RxDemodulator {
         for &s in played {
             self.reference.push_back(s);
         }
-        // Reference не должен расти безгранично.
-        while self.reference.len() > self.max_buf {
+        while self.reference.len() > self.max_frame * 2 {
             self.reference.pop_front();
         }
     }
@@ -108,119 +163,164 @@ impl RxDemodulator {
     /// Кладёт захваченные с микрофона сэмплы; прогоняет через эхоподавитель (шов).
     pub fn push_captured(&mut self, captured: &[f32]) {
         let mut block = captured.to_vec();
-        // Reference того же интервала (приблизительно) — для FDD canceller его игнорирует.
         let mut refs: Vec<f32> = Vec::with_capacity(block.len());
         for _ in 0..block.len() {
             refs.push(self.reference.pop_front().unwrap_or(0.0));
         }
         self.canceller.process(&mut block, &refs);
         self.buf.extend_from_slice(&block);
-        self.since_attempt += block.len();
+        self.since_force += block.len();
         self.since_log += block.len();
     }
 
-    /// Уровень (RMS) последнего ~0.25 c буфера.
-    fn recent_rms(&self) -> f32 {
-        let win = (self.sample_rate / 4).max(1).min(self.buf.len());
-        if win == 0 {
-            return 0.0;
+    /// RMS хвоста длиной `n` сэмплов.
+    fn tail_rms(&self, n: usize) -> (f32, f32) {
+        let n = n.max(1).min(self.buf.len());
+        if n == 0 {
+            return (0.0, 0.0);
         }
-        let tail = &self.buf[self.buf.len() - win..];
-        (tail.iter().map(|x| x * x).sum::<f32>() / win as f32).sqrt()
+        let tail = &self.buf[self.buf.len() - n..];
+        let rms = (tail.iter().map(|x| x * x).sum::<f32>() / n as f32).sqrt();
+        let peak = tail.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
+        (rms, peak)
     }
 
-    /// Пытается извлечь готовые кадры из буфера. Тяжёлая демодуляция запускается только
-    /// при наличии энергии (относительно адаптивного шумового пола) и не чаще, чем раз в
-    /// ~100 мс накопленного аудио — иначе на длинном CSS-кадре демод по всему буферу
-    /// каждые 5 мс пожирает CPU.
+    /// Есть ли где-нибудь в буфере всплеск выше гейта (без перекрытия окон — дёшево).
+    fn buf_has_burst(&self, gate: f32) -> bool {
+        let win = (self.sample_rate / 20).max(1); // 50 мс
+        if self.buf.len() < win {
+            return false;
+        }
+        let mut i = 0;
+        while i + win <= self.buf.len() {
+            let e: f32 = self.buf[i..i + win].iter().map(|x| x * x).sum::<f32>() / win as f32;
+            if e.sqrt() > gate {
+                return true;
+            }
+            i += win;
+        }
+        false
+    }
+
+    /// Извлекает кадры из буфера, сегментируя поток по паузам (см. док к типу).
     pub fn poll(&mut self) -> Vec<RxEvent> {
         let mut out = Vec::new();
-        let recent = self.recent_rms();
+        let sr = self.sample_rate;
+        if self.buf.is_empty() {
+            return out;
+        }
 
-        // Диагностика раз в ~секунду: видно, слышит ли микрофон хоть что-то.
-        if self.since_log >= self.sample_rate {
+        let (recent, peak) = self.tail_rms(sr / 8); // хвост ~125 мс для детекции паузы
+
+        // Шумовой пол: быстро вниз (садится к тишине), медленно вверх (всплеск не задирает).
+        if self.noise_rms <= 1e-9 {
+            self.noise_rms = recent.max(1e-6);
+        } else if recent < self.noise_rms {
+            self.noise_rms = 0.6 * self.noise_rms + 0.4 * recent;
+        } else {
+            self.noise_rms = 0.99 * self.noise_rms + 0.01 * recent;
+        }
+        // Гейт: выше шумового пола, но с разумным абсолютным минимумом.
+        let gate = (self.noise_rms * 3.0).max(0.006);
+        self.stat_rms = recent;
+        self.stat_peak = peak;
+        self.stat_gate = gate;
+
+        let tail_hot = recent > gate;
+
+        if self.since_log >= sr {
             self.since_log = 0;
             eprintln!(
-                "sonic-rx: уровень захвата rms={recent:.4} (шумовой пол {:.4}, буфер {} c)",
+                "sonic-rx: rms={recent:.4} пик={peak:.3} пол={:.4} гейт={gate:.4} буфер={:.1}c {} (ok={} bad={})",
                 self.noise_rms,
-                self.buf.len() / self.sample_rate.max(1)
+                self.buf.len() as f32 / sr as f32,
+                if tail_hot { "[СИГНАЛ]" } else { "[тихо]" },
+                self.frames_ok,
+                self.frames_bad
             );
         }
 
-        // Порог: выше шумового пола, но с низким абсолютным минимумом (тихий микрофон не
-        // должен блокироваться навсегда). Множитель 2× (а не 3×): по воздуху между двумя
-        // устройствами принятый сигнал бывает всего вдвое-втрое громче шума, и слишком
-        // жадный гейт вообще не давал демодулятору шанса. Сам гейт лишь экономит CPU —
-        // ложный кадр отсекают sync-маркеры модемов, а не этот порог.
-        let gate = (self.noise_rms * 2.0).max(0.0025);
-        let has_signal = recent > gate;
-        if !has_signal {
-            // Тишина/шум — медленно обновляем оценку шумового пола и не демодулируем.
-            self.noise_rms = if self.noise_rms == 0.0 {
-                recent
-            } else {
-                0.95 * self.noise_rms + 0.05 * recent
-            };
-            self.trim_if_needed();
-            return out;
-        }
-
-        // Троттлинг: не запускать демод чаще, чем раз в ~100 мс нового аудио.
-        if self.buf.len() < self.min_attempt || self.since_attempt < self.sample_rate / 10 {
-            return out;
-        }
-        self.since_attempt = 0;
-
-        loop {
-            let mut found: Option<(RxEvent, usize)> = None;
-            for m in &self.modems {
-                if let Some(d) = m.demodulate(&self.buf) {
-                    // Принимаем декод только если кадр проходит CRC (Frame::parse). Иначе
-                    // чужой модем (например, OFDM-16QAM на сигнале OFDM-QPSK — у них общая
-                    // преамбула) «захватил» бы кадр, выдал мусор и СРЕЗАЛ буфер до нужного
-                    // демодулятора — настоящий кадр терялся бы. CRC-проверка снимает
-                    // неоднозначность: неверная модуляция → мусорные байты → CRC не сойдётся.
-                    if Frame::parse(&d.bytes).is_ok() {
-                        found = Some((
-                            RxEvent {
-                                bytes: d.bytes,
-                                snr_db: d.snr_db,
-                                mode: m.mode(),
-                            },
-                            d.end_sample,
-                        ));
-                        break;
-                    }
+        if tail_hot {
+            // Идёт всплеск — копим. Защита от «бесконечного» всплеска (непрерывный шум/очень
+            // длинный кадр): раз в ~0.4 c пробуем декодировать, если буфер перерос макс. кадр.
+            if self.buf.len() > self.max_frame + sr / 2 && self.since_force >= sr * 2 / 5 {
+                self.since_force = 0;
+                if let Some(ev) = self.try_decode() {
+                    self.record_ok(&ev);
+                    out.push(ev);
+                    self.buf.clear();
+                } else {
+                    // Не декодировалось — сдвигаем окно вперёд, чтобы не переть тот же префикс.
+                    let keep = self.max_frame;
+                    let drop = self.buf.len().saturating_sub(keep);
+                    self.buf.drain(0..drop);
                 }
             }
-            match found {
-                Some((ev, end)) => {
-                    eprintln!(
-                        "sonic-rx: поймал кадр {:?}, {} байт, SNR {:.1} дБ",
-                        ev.mode,
-                        ev.bytes.len(),
-                        ev.snr_db
-                    );
-                    out.push(ev);
-                    let end = end.min(self.buf.len());
-                    self.buf.drain(0..end);
-                }
-                None => {
-                    self.trim_if_needed();
-                    break;
-                }
+            return out;
+        }
+
+        // Хвост тихий. Если в буфере был всплеск — это конец кадра, декодируем и очищаем.
+        if self.buf_has_burst(gate) {
+            if let Some(ev) = self.try_decode() {
+                self.record_ok(&ev);
+                out.push(ev);
+            }
+            self.buf.clear();
+        } else {
+            // Чистая тишина — держим короткий lead-in, не копим тишину бесконечно.
+            let keep = (sr / 3).min(self.buf.len());
+            let drop = self.buf.len() - keep;
+            if drop > 0 {
+                self.buf.drain(0..drop);
             }
         }
         out
     }
 
-    /// Обрезка буфера, если он перерос максимум (кадр так и не собрался/не найден).
-    fn trim_if_needed(&mut self) {
-        if self.buf.len() > self.max_buf {
-            let keep = self.max_buf / 2;
-            let drop = self.buf.len() - keep;
-            self.buf.drain(0..drop);
+    fn record_ok(&mut self, ev: &RxEvent) {
+        self.frames_ok += 1;
+        self.last_snr_db = ev.snr_db;
+        eprintln!(
+            "sonic-rx: ✓ кадр {:?} {}Б SNR {:.1}дБ (всего ok={})",
+            ev.mode,
+            ev.bytes.len(),
+            ev.snr_db,
+            self.frames_ok
+        );
+    }
+
+    /// Пробует все модемы на текущем буфере; принимает только кадр, прошедший CRC. Логирует
+    /// причину неудачи (нет преамбулы vs преамбула есть, но CRC битый) — для отладки на железе.
+    fn try_decode(&mut self) -> Option<RxEvent> {
+        let mut detected_bad = false;
+        for m in &self.modems {
+            if let Some(d) = m.demodulate(&self.buf) {
+                // CRC снимает неоднозначность между модемами (напр. OFDM-QPSK/16QAM — общая
+                // преамбула): неверная модуляция → мусорные байты → CRC не сойдётся.
+                if Frame::parse(&d.bytes).is_ok() {
+                    return Some(RxEvent {
+                        bytes: d.bytes,
+                        snr_db: d.snr_db,
+                        mode: m.mode(),
+                    });
+                }
+                detected_bad = true;
+            }
         }
+        let secs = self.buf.len() as f32 / self.sample_rate as f32;
+        if detected_bad {
+            self.frames_bad += 1;
+            eprintln!(
+                "sonic-rx: ✗ синхронизация есть, но CRC битый — низкий SNR/искажения (всплеск {secs:.2}c, пик {:.3})",
+                self.stat_peak
+            );
+        } else {
+            eprintln!(
+                "sonic-rx: ✗ преамбула не поймана во всплеске {secs:.2}c (пик {:.3}, гейт {:.4})",
+                self.stat_peak, self.stat_gate
+            );
+        }
+        None
     }
 }
 
@@ -283,12 +383,13 @@ mod tests {
         );
         let samples = tx.modulate(PhyMode::Css, &frame.serialize());
 
-        // Эмулируем захват потоком: тишина, затем кадр по кускам, затем тишина.
+        // Эмулируем захват потоком: тишина, кадр по кускам, затем ПАУЗА (>125 мс) — по ней
+        // приёмник понимает, что всплеск-кадр завершён (полудуплекс: между кадрами всегда тихо).
         rx.push_captured(&vec![0.0f32; 3000]);
         for chunk in samples.chunks(4096) {
             rx.push_captured(chunk);
         }
-        rx.push_captured(&vec![0.0f32; 3000]);
+        rx.push_captured(&vec![0.0f32; 16000]);
 
         let events = rx.poll();
         assert_eq!(events.len(), 1, "expected exactly one frame");
@@ -317,7 +418,7 @@ mod tests {
 
         rx.push_captured(&vec![0.0f32; 3000]);
         rx.push_captured(&back);
-        rx.push_captured(&vec![0.0f32; 3000]);
+        rx.push_captured(&vec![0.0f32; 16000]);
 
         let events = rx.poll();
         assert_eq!(events.len(), 1, "кадр потерян после ресемплинга 48k↔44.1k ({mode:?})");
@@ -343,6 +444,51 @@ mod tests {
     }
 
     #[test]
+    fn streaming_decodes_successive_frames_without_getting_stuck() {
+        // Ключевая регрессия: реальный поток идёт мелкими кусками, poll крутится постоянно,
+        // кадры разделены паузами. Раньше буфер рос и приёмник цеплялся за застрявший префикс
+        // → второй (и часто первый) кадр не декодировался. Проверяем, что ДВА кадра подряд
+        // проходят — значит forward progress есть, застрявшего буфера нет.
+        fn feed(rx: &mut RxDemodulator, samples: &[f32], out: &mut Vec<String>) {
+            for chunk in samples.chunks(1024) {
+                rx.push_captured(chunk);
+                for ev in rx.poll() {
+                    if let Ok(f) = Frame::parse(&ev.bytes) {
+                        out.push(String::from_utf8_lossy(&f.payload).into_owned());
+                    }
+                }
+            }
+        }
+
+        let (initiator, responder) = peer_schemes();
+        let tx = Transmitter::new(&initiator);
+        let mut rx = RxDemodulator::new(&responder);
+        let dir = initiator.role().direction_bit();
+        let silence = vec![0.0f32; 24_000]; // 0.5 c паузы между кадрами
+
+        let mut decoded: Vec<String> = Vec::new();
+        for msg in ["first frame here", "second frame here"] {
+            let frame = Frame::new(
+                FrameHeader::new(PhyMode::OfdmQpsk, FrameType::Data, dir),
+                msg.as_bytes().to_vec(),
+            );
+            let sig = tx.modulate(PhyMode::OfdmQpsk, &frame.serialize());
+            feed(&mut rx, &silence, &mut decoded);
+            feed(&mut rx, &sig, &mut decoded);
+            feed(&mut rx, &silence, &mut decoded);
+        }
+
+        assert!(
+            decoded.iter().any(|s| s == "first frame here"),
+            "первый кадр не декодирован: {decoded:?}"
+        );
+        assert!(
+            decoded.iter().any(|s| s == "second frame here"),
+            "второй кадр не декодирован — застрявший буфер: {decoded:?}"
+        );
+    }
+
+    #[test]
     fn reference_seam_accepts_playback_copy() {
         // Шов AEC: reference принимается и (для FDD) не влияет на приём.
         let (initiator, responder) = peer_schemes();
@@ -356,7 +502,7 @@ mod tests {
         rx.push_reference(&vec![0.3f32; 5000]); // как будто мы что-то играли
         rx.push_captured(&vec![0.0f32; 3000]);
         rx.push_captured(&samples);
-        rx.push_captured(&vec![0.0f32; 3000]);
+        rx.push_captured(&vec![0.0f32; 16000]);
         let events = rx.poll();
         assert_eq!(events.len(), 1);
         assert_eq!(Frame::parse(&events[0].bytes).unwrap(), frame);

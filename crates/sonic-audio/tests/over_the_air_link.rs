@@ -29,12 +29,13 @@ fn deliver(sender: &Tdd, receiver: &Tdd, mode: PhyMode, msg: &[u8], seed: u64) -
     let aired = OverTheAir::typical(44_100.0, seed).apply(&at_hw);
     let back = Resampler::new(44_100, 48_000).process_all(&aired);
 
-    // Немного тишины по краям; хвост короче окна «свежести» приёмника, чтобы кадр остался в нём.
+    // Тишина по краям; хвост >125 мс — по этой паузе приёмник понимает, что кадр-всплеск
+    // завершён (полудуплекс: между кадрами всегда тихо), и запускает демодуляцию.
     rx.push_captured(&vec![0.0f32; 4000]);
     for chunk in back.chunks(4096) {
         rx.push_captured(chunk);
     }
-    rx.push_captured(&vec![0.0f32; 2000]);
+    rx.push_captured(&vec![0.0f32; 16000]);
 
     rx.poll()
         .iter()

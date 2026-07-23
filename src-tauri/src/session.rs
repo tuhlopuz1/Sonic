@@ -4,7 +4,7 @@
 //!
 //! Что делает поток сессии:
 //! - режет исходящее сообщение на чанки, кладёт под FEC, шлёт кадрами с ARQ-окном;
-//! - принимает кадры, фильтрует своё эхо по direction, декодирует FEC, собирает чанки;
+//! - принимает кадры, фильтрует своё эхо по src (id устройства), декодирует FEC, собирает чанки;
 //! - шлёт ACK встречным потоком, обрабатывает входящие ACK, ретрансмитит по таймауту;
 //! - ведёт auto-fallback режима по деградации канала и телеметрию (событие link-quality).
 //!
@@ -16,7 +16,7 @@
 
 use crate::events;
 use serde::Serialize;
-use sonic_audio::{DuplexEngine, EngineConfig, RxEvent};
+use sonic_audio::{DuplexEngine, EngineConfig, EngineDebug, RxEvent};
 use sonic_protocol::arq::{ArqConfig, ArqReceiver, ArqSender, AutoFallback};
 use sonic_protocol::bandplan::{DuplexScheme, Tdd};
 use sonic_protocol::fec::FecCodec;
@@ -98,6 +98,7 @@ impl SessionHandle {
     ) -> Result<SessionHandle, String> {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (evt_tx, evt_rx) = crossbeam_channel::unbounded::<RxEvent>();
+        let (dbg_tx, dbg_rx) = crossbeam_channel::unbounded::<EngineDebug>();
 
         let engine = DuplexEngine::start(
             EngineConfig {
@@ -107,11 +108,12 @@ impl SessionHandle {
                 output_device,
             },
             evt_tx,
+            dbg_tx,
         )?;
 
         std::thread::Builder::new()
             .name("sonic-session".into())
-            .spawn(move || session_loop(app, profile, role, engine, cmd_rx, evt_rx))
+            .spawn(move || session_loop(app, profile, role, engine, cmd_rx, evt_rx, dbg_rx))
             .map_err(|e| format!("spawn session: {e}"))?;
 
         Ok(SessionHandle { cmd_tx })
@@ -167,6 +169,21 @@ struct SessionStateEvent {
     state: &'static str, // "up" | "down"
 }
 
+/// Отладка аудио-тракта для панели диагностики в UI.
+#[derive(Serialize, Clone)]
+struct RxDebugEvent {
+    rms: f32,
+    peak: f32,
+    noise_floor: f32,
+    gate: f32,
+    buffer_secs: f32,
+    in_burst: bool,
+    tx_active: bool,
+    frames_ok: u32,
+    frames_bad: u32,
+    last_snr_db: f32,
+}
+
 fn mode_label(mode: PhyMode) -> &'static str {
     mode.label()
 }
@@ -191,9 +208,25 @@ fn session_loop(
     engine: DuplexEngine,
     cmd_rx: mpsc::Receiver<SessionCommand>,
     evt_rx: crossbeam_channel::Receiver<RxEvent>,
+    dbg_rx: crossbeam_channel::Receiver<EngineDebug>,
 ) {
     let fec = FecCodec::new(FEC_K, FEC_NSYM);
-    let my_dir = role.direction_bit();
+    // Случайный идентификатор устройства на сессию: приёмник по нему отличает СВОЁ эхо от
+    // кадров пира, поэтому связь работает без ручного согласования ролей. Старший бит берём из
+    // роли: если пользователи выбрали РАЗНЫЕ роли — src гарантированно различны; если одну и ту
+    // же — различны с вероятностью 127/128 (при редкой коллизии поможет перезапуск сессии).
+    let my_src: u8 = {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        ((h.finish() as u8) & 0x7F) | ((role.direction_bit() & 1) << 7)
+    };
+    eprintln!("sonic-session: мой src=0x{my_src:02X} (роль {role:?})");
     let scheme = Tdd::new(role, profile);
     // Репрезентативный размер кадра данных (FEC-байт на полный чанк) для оценки airtime.
     let rep_payload = fec.encoded_len(4 + CHUNK_LEN);
@@ -251,8 +284,8 @@ fn session_loop(
                     continue;
                 }
             };
-            // Фильтр собственного эха: свой direction игнорируем.
-            if frame.header.direction == my_dir {
+            // Фильтр собственного эха: кадры со СВОИМ src игнорируем (это мы сами).
+            if frame.header.src == my_src {
                 continue;
             }
             eprintln!(
@@ -271,7 +304,7 @@ fn session_loop(
                         &mut reassembly,
                         &app,
                         &engine,
-                        my_dir,
+                        my_src,
                         current_mode(policy, &fb),
                     );
                 }
@@ -300,7 +333,7 @@ fn session_loop(
             let mode = current_mode(policy, &fb);
             if let Some(seq) = arq_tx.send(chunk.payload.clone(), now_ms()) {
                 sent_meta.insert(seq, (chunk.msg_id, chunk.text.clone()));
-                transmit_frame(&engine, mode, FrameType::Data, my_dir, seq, &arq_rx, &chunk.payload);
+                transmit_frame(&engine, mode, FrameType::Data, my_src, seq, &arq_rx, &chunk.payload);
             }
         }
 
@@ -310,7 +343,7 @@ fn session_loop(
             let mode = current_mode(policy, &fb);
             let retx = arq_tx.due_retransmissions(now_ms());
             for (seq, payload) in &retx {
-                transmit_frame(&engine, mode, FrameType::Data, my_dir, *seq, &arq_rx, payload);
+                transmit_frame(&engine, mode, FrameType::Data, my_src, *seq, &arq_rx, payload);
             }
             if !retx.is_empty() && policy == ModePolicy::Auto && fb.on_failure() {
                 apply_mode_change(&mut arq_tx, &fb, &link, policy, role, &airtime);
@@ -325,6 +358,29 @@ fn session_loop(
             link.mode = current_mode(policy, &fb);
             link.retransmits = arq_tx.retransmits();
             emit_link_quality(&app, &link, arq_tx.in_flight());
+        }
+
+        // Отладочные снимки уровней аудио → в UI (берём самый свежий).
+        let mut latest_dbg = None;
+        while let Ok(d) = dbg_rx.try_recv() {
+            latest_dbg = Some(d);
+        }
+        if let Some(d) = latest_dbg {
+            let _ = app.emit(
+                events::RX_DEBUG,
+                RxDebugEvent {
+                    rms: d.rx.rms,
+                    peak: d.rx.peak,
+                    noise_floor: d.rx.noise_floor,
+                    gate: d.rx.gate,
+                    buffer_secs: d.rx.buffer_secs,
+                    in_burst: d.rx.in_burst,
+                    tx_active: d.tx_active,
+                    frames_ok: d.rx.frames_ok,
+                    frames_bad: d.rx.frames_bad,
+                    last_snr_db: d.rx.last_snr_db,
+                },
+            );
         }
 
         std::thread::sleep(Duration::from_millis(15));
@@ -394,13 +450,13 @@ fn transmit_frame(
     engine: &DuplexEngine,
     mode: PhyMode,
     frame_type: FrameType,
-    direction: u8,
+    src: u8,
     seq: u16,
     arq_rx: &ArqReceiver<Vec<u8>>,
     payload: &[u8],
 ) {
     let (cum, sack) = arq_rx.ack_info();
-    let mut header = FrameHeader::new(mode, frame_type, direction);
+    let mut header = FrameHeader::new(mode, frame_type, src);
     header.seq = seq;
     header.ack = cum;
     header.sack = sack;
@@ -416,7 +472,7 @@ fn handle_data(
     reassembly: &mut HashMap<u16, Reassembly>,
     app: &AppHandle,
     engine: &DuplexEngine,
-    my_dir: u8,
+    my_src: u8,
     mode: PhyMode,
 ) {
     // Переупорядочивание/дедуп на MAC-уровне.
@@ -427,7 +483,7 @@ fn handle_data(
         }
     }
     // ACK встречным потоком (в текущем режиме — см. модульный комментарий).
-    transmit_frame(engine, mode, FrameType::Ack, my_dir, 0, arq_rx, &[]);
+    transmit_frame(engine, mode, FrameType::Ack, my_src, 0, arq_rx, &[]);
 }
 
 /// Разбор внутреннего чанка и сборка сообщения; при полном наборе — событие в UI.
