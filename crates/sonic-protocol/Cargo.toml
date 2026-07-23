@@ -1,0 +1,24 @@
+[package]
+name = "sonic-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "DSP/протокольное ядро ADL/1: CSS и OFDM модемы, FEC, framing, ARQ, симканал"
+
+# Чистый Rust: без ОС/аудио зависимостей (никакого cpal/tauri) — юнит-тестируется
+# без железа и портируем в сторону будущей embedded-цели (ESP32, см. plan.md §7).
+[dependencies]
+rustfft = { workspace = true }
+num-complex = { workspace = true }
+crc32fast = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+hound = { workspace = true }
+
+# BER/throughput-свип по SNR для обоих режимов — предъявляемое жюри доказательство
+# «эффективности/устойчивости» (plan.md §2, критерии в PROTOCOL.md §12).
+[[example]]
+name = "ber_sweep"
+path = "examples/ber_sweep.rs"

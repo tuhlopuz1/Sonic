@@ -1,0 +1,19 @@
+[package]
+name = "sonic-audio"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "cpal duplex-движок и пайплайн (capture→decode / encode→playback) поверх sonic-protocol"
+
+[dependencies]
+sonic-protocol = { workspace = true }
+cpal = { workspace = true }
+rtrb = { workspace = true }
+crossbeam-channel = { workspace = true }
+num-complex = { workspace = true }
+
+[features]
+# Тесты, открывающие реальные аудио-потоки — только по флагу, чтобы cargo test на
+# headless CI-раннерах без звукового устройства оставался безопасным (plan.md §6).
+real-audio-tests = []

@@ -12,6 +12,16 @@ pub fn ensure_record_audio_permission() -> Result<bool, String> {
 
     const PERMISSION_GRANTED: i32 = 0;
 
+    // `ndk_context::android_context()` не возвращает ошибку, а паникует, если контекст не
+    // заполнен (см. `android_ctx`), — а паника отсюда прилетает в JNI-кадр tauri-команды
+    // и убивает процесс. Поэтому сначала проверяем готовность своим флагом.
+    if !crate::android_ctx::is_ready() {
+        return Err(
+            "JNI-контекст Android не инициализирован — SonicNative.initAndroidContext не был вызван"
+                .to_string(),
+        );
+    }
+
     let ctx = ndk_context::android_context();
     let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }
         .map_err(|e| format!("JavaVM::from_raw: {e}"))?;

@@ -1,0 +1,35 @@
+# Virtual workspace: аудио-мессенджер поверх акустического канала (см. plan.md, PROTOCOL.md).
+#
+#   crates/sonic-protocol — чистое DSP/протокольное ядро (без ОС/аудио), юнит-тестируемое.
+#   crates/sonic-audio    — cpal duplex-движок, мосты ring-buffer, шов под AEC.
+#   src-tauri             — Tauri-приложение: команды/события/состояние + фронтенд.
+#
+# Физический target-dir запинен на src-tauri/target через .cargo/config.toml, чтобы не
+# переписывать зашитые пути в CI (ci.yml/release.yml) и Android Gradle-плагине.
+[workspace]
+resolver = "2"
+members = ["src-tauri", "crates/sonic-protocol", "crates/sonic-audio"]
+
+[workspace.package]
+edition = "2021"
+version = "0.2.2"
+authors = ["tuhlopuz"]
+license = "MIT"
+
+[workspace.dependencies]
+sonic-protocol = { path = "crates/sonic-protocol" }
+sonic-audio = { path = "crates/sonic-audio" }
+rustfft = "6"
+num-complex = "0.4"
+crc32fast = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+cpal = "0.15"
+rtrb = "0.3"
+crossbeam-channel = "0.5"
+hound = "3.5"
+
+# Релизный профиль: DSP-циклы (FFT, дечирп, RS) выигрывают от оптимизаций.
+[profile.release]
+opt-level = 3
+lto = "thin"

@@ -12,6 +12,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Юнит-тесты DSP/протокольного ядра (sonic-protocol) и аудио-пайплайна (sonic-audio)
+  # без Android SDK/GUI и без звукового устройства (реально-аудио тесты за feature-флагом).
+  # Полная сборка Tauri-приложения проверяется в health-check-* ниже.
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> src-tauri/target
+
+      - name: Install ALSA dev headers (cpal build dep for sonic-audio)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Run DSP/protocol unit tests
+        run: cargo test -p sonic-protocol -p sonic-audio --locked
+
   health-check-desktop:
     strategy:
       fail-fast: false
@@ -48,7 +68,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri -> target
+          workspaces: . -> src-tauri/target
 
       - run: npm ci
 
@@ -128,7 +148,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri -> target
+          workspaces: . -> src-tauri/target
 
       - uses: actions/setup-java@v4
         with:
@@ -145,13 +165,17 @@ jobs:
 
       - run: npm ci
 
-      - name: Build debug APK (x86_64 only)
-        run: npm run tauri android build -- --debug --apk --target x86_64
+      # Именно release, а не debug: релизная сборка отличается от отладочной R8-минификацией
+      # (переименование классов ломает поиск по имени из JNI) и подписью — и раньше ни то,
+      # ни другое не проверялось вообще, потому что на эмулятор ставился debug-APK.
+      # Ключа подписи в CI нет, Gradle возьмёт отладочный — для эмулятора этого достаточно.
+      - name: Build release APK (x86_64 only)
+        run: npm run tauri android build -- --apk --target x86_64
 
       - name: Locate built APK
         id: apk
         run: |
-          APK=$(find src-tauri/gen/android -name "*-debug.apk" | head -n 1)
+          APK=$(find src-tauri/gen/android -name "*-release.apk" | head -n 1)
           echo "Found $APK"
           echo "path=$APK" >> "$GITHUB_OUTPUT"
 
@@ -172,6 +196,16 @@ jobs:
           disable-animations: true
           script: |
             adb install -r "${{ steps.apk.outputs.path }}"
+            adb shell pm grant com.tuhlopuz.sonic android.permission.RECORD_AUDIO
+            adb logcat -c
             adb shell monkey -p com.tuhlopuz.sonic -c android.intent.category.LAUNCHER 1
-            sleep 8
-            PID=$(adb shell pidof com.tuhlopuz.sonic | tr -d '\r'); if [ -z "$PID" ]; then echo "FAIL: app is not running on emulator"; echo "--- logcat lines mentioning our package ---"; adb logcat -d | grep -i tuhlopuz.sonic; echo "--- last 200 logcat lines (fallback) ---"; adb logcat -d | tail -n 200; exit 1; fi; echo "OK: app running with pid $PID"
+            sleep 15
+            FAILED=0
+            PID=$(adb shell pidof com.tuhlopuz.sonic | tr -d '\r'); if [ -z "$PID" ]; then echo "FAIL: app is not running on emulator"; FAILED=1; else echo "OK: app running with pid $PID"; fi
+            # Живой процесс — ещё не «работает»: паника в Rust-потоке молча убивает только
+            # этот поток, а список устройств при этом уже не приедет. Поэтому проверяем лог.
+            if adb logcat -d | grep -qE "panicked at|android context was not initialized|UnsatisfiedLinkError"; then echo "FAIL: Rust panic / UnsatisfiedLinkError in logcat"; FAILED=1; fi
+            # FATAL EXCEPTION в общем логе может быть и от чужого системного приложения —
+            # засчитываем только тот стек, в котором упомянут наш пакет.
+            if adb logcat -d | grep -A15 "FATAL EXCEPTION" | grep -q "com.tuhlopuz.sonic"; then echo "FAIL: fatal exception in our app"; FAILED=1; fi
+            if [ "$FAILED" -ne 0 ]; then echo "--- logcat lines mentioning our package ---"; adb logcat -d | grep -iE "tuhlopuz.sonic|panicked|RustStdoutStderr"; echo "--- last 200 logcat lines (fallback) ---"; adb logcat -d | tail -n 200; exit 1; fi

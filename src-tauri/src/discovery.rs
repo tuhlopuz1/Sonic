@@ -8,8 +8,9 @@
 //! окна записи и будет декодирован целиком хотя бы раз.
 
 use crate::acoustic_beacon;
+use crate::channel_check::AudioSelection;
 use crate::channel_check;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::StreamTrait;
 use serde::Serialize;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
@@ -31,7 +32,11 @@ pub struct DiscoveredDevice {
     pub round: u32,
 }
 
-pub fn discover(app: AppHandle, nickname: String) -> Result<(), String> {
+pub fn discover(
+    app: AppHandle,
+    nickname: String,
+    selection: AudioSelection,
+) -> Result<(), String> {
     if !crate::android_permissions::ensure_record_audio_permission()? {
         return Err(
             "Доступ к микрофону не разрешён (RECORD_AUDIO). Разрешите доступ к микрофону для этого приложения в настройках Android и повторите поиск."
@@ -45,7 +50,7 @@ pub fn discover(app: AppHandle, nickname: String) -> Result<(), String> {
 
     std::thread::spawn(move || {
         for round in 0..ROUNDS {
-            match run_round(&nickname, round) {
+            match run_round(&nickname, round, &selection) {
                 Ok(devices) => {
                     for device in devices {
                         let _ = app.emit("device-discovered", device);
@@ -62,24 +67,20 @@ pub fn discover(app: AppHandle, nickname: String) -> Result<(), String> {
     Ok(())
 }
 
-fn run_round(nickname: &str, round: u32) -> Result<Vec<DiscoveredDevice>, String> {
-    let host = cpal::default_host();
-    let input_device = host
-        .default_input_device()
-        .ok_or_else(|| "Микрофон не найден".to_string())?;
-    let output_device = host
-        .default_output_device()
-        .ok_or_else(|| "Динамик не найден".to_string())?;
-    let input_config = input_device
-        .default_input_config()
-        .map_err(|e| format!("Не удалось получить конфигурацию микрофона: {e}"))?;
-    let output_config = output_device
-        .default_output_config()
-        .map_err(|e| format!("Не удалось получить конфигурацию динамика: {e}"))?;
+fn run_round(
+    nickname: &str,
+    round: u32,
+    selection: &AudioSelection,
+) -> Result<Vec<DiscoveredDevice>, String> {
+    let (input_device, input_config) =
+        sonic_audio::device::open_input(48_000, selection.input_name())?;
+    let (output_device, output_config) =
+        sonic_audio::device::open_output(48_000, selection.output_name())?;
     let output_sample_rate = output_config.sample_rate().0 as f32;
 
     // Короткая тишина перед раундом — опорный шумовой пол для SNR декодированных маячков.
-    let (noise_samples, input_sample_rate) = channel_check::capture_audio(PRE_ROUND_NOISE_MS)?;
+    let (noise_samples, input_sample_rate) =
+        channel_check::capture_audio(PRE_ROUND_NOISE_MS, selection.input_name())?;
     let noise_floor_rms = channel_check::rms(&noise_samples);
 
     // Момент внутри раунда, когда МЫ проигрываем свой маячок, зависит только от своего

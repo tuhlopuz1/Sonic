@@ -44,6 +44,13 @@ android {
                 storePassword = keystoreProperties["storePassword"] as String
                 keyAlias = keystoreProperties["keyAlias"] as String
                 keyPassword = keystoreProperties["keyPassword"] as String
+                // v2/v3 при minSdk 24 достаточно, и AGP по умолчанию отключает v1 —
+                // но часть прошивок и сторонних установщиков до сих пор смотрит только
+                // на META-INF/*.RSA и без него говорит «проблема с подписью пакета».
+                // Три схемы разом дешевле, чем разбираться, у кого именно так.
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
             }
         }
     }
@@ -64,6 +71,12 @@ android {
             signingConfig = if (keystorePropertiesFile.exists()) {
                 signingConfigs.getByName("release")
             } else {
+                logger.warn(
+                    "keystore.properties не найден — release-APK будет подписан ОТЛАДОЧНЫМ ключом. " +
+                        "Такой APK часть прошивок ставить отказывается, а обновить его поверх " +
+                        "нормального релиза нельзя вообще (Android считает это другим приложением). " +
+                        "Годится только для локальной проверки; в CI отсутствие ключа — ошибка сборки."
+                )
                 signingConfigs.getByName("debug")
             }
             proguardFiles(

@@ -1,0 +1,5 @@
+# Пин физического target-dir туда, где его ждут CI (ci.yml/release.yml, пути вида
+# src-tauri/target/...) и Android Gradle-плагин (rootDirRel относительно src-tauri).
+# Без этого конверсия в workspace сдвинула бы target/ в корень и сломала все зашитые пути.
+[build]
+target-dir = "src-tauri/target"
