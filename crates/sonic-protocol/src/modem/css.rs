@@ -30,8 +30,16 @@ const PREAMBLE_DOWN: usize = 2; // маркер конца преамбулы
 const SYNC_SYMS: usize = 1; // sync-символ = MAGIC_SYNC
 const LEN_REPS: usize = 3; // длина кадра шлётся 3× с мажоритарным голосованием
 
-/// Параметры CSS. По умолчанию — из PROTOCOL.md §4.1 (BW=1600 Гц, SF=8 → 160 мс/символ,
-/// ~50 бит/с). SF адаптивен 6–10: ниже SF — быстрее, выше — надёжнее.
+/// Параметры CSS. SF=8 даёт 8 бит/символ и большой processing gain (integration по
+/// всей длительности символа). Полоса BW определяет длительность символа:
+/// `sps = fs·2^SF/BW`, символ = `sps/fs` секунд, скорость = `SF·BW/2^SF` бит/с.
+///
+/// По умолчанию BW=6000 Гц → sps=2048 @48 кГц → символ 42.7 мс, ~187 бит/с. Это на
+/// порядок быстрее прежних 1600 Гц (50 бит/с, символ 160 мс), при котором даже короткое
+/// сообщение занимало 6–12 с эфира и MAC-таймауты успевали объявить связь мёртвой ещё
+/// до конца передачи кадра. BW ужимается под ширину под-полосы (см. `new`), поэтому
+/// 6000 Гц влезает и в нижнюю (6700 Гц), и в верхнюю (7200 Гц) полосу FDD с запасом.
+/// SF адаптивен 6–10: ниже SF — быстрее, выше — надёжнее.
 #[derive(Debug, Clone, Copy)]
 pub struct CssParams {
     pub sf: u32,
@@ -42,7 +50,7 @@ impl Default for CssParams {
     fn default() -> Self {
         CssParams {
             sf: 8,
-            bandwidth_hz: 1600.0,
+            bandwidth_hz: 6000.0,
         }
     }
 }
@@ -154,6 +162,49 @@ impl CssModem {
         let noise_mean = ((sum - best) / (self.n_sym as f32 - 1.0)).max(1e-20).sqrt();
         (best_bin as u16, peak, noise_mean)
     }
+
+    /// Как [`demod_symbol`], но с СУБ-БИННОЙ (параболической) оценкой позиции пика — для
+    /// точной временной синхронизации/оценки дрейфа по преамбуле. Возвращает
+    /// (дробный бин, пик, шум) или `None`, если спектр пуст.
+    fn demod_symbol_frac(&self, bb: &[Complex32], off: usize) -> Option<(f32, f32, f32)> {
+        if off + self.sps > bb.len() {
+            return None;
+        }
+        let mut buf: Vec<Complex32> = (0..self.sps)
+            .map(|n| bb[off + n] * self.base_up_conj[n])
+            .collect();
+        self.fft.forward(&mut buf);
+
+        let mut fold = vec![0.0f32; self.n_sym];
+        for (bin, c) in buf.iter().enumerate() {
+            fold[bin % self.n_sym] += c.norm_sqr();
+        }
+        let mut best_bin = 0usize;
+        let mut best = f32::MIN;
+        let mut sum = 0.0f32;
+        for (bin, &m) in fold.iter().enumerate() {
+            sum += m;
+            if m > best {
+                best = m;
+                best_bin = bin;
+            }
+        }
+        // Параболическая интерполяция по соседним (циклически) бинам: вершина параболы
+        // через (b-1, b, b+1) даёт дробное смещение пика в пределах ±0.5 бина.
+        let nm = self.n_sym;
+        let alpha = fold[(best_bin + nm - 1) % nm];
+        let beta = fold[best_bin];
+        let gamma = fold[(best_bin + 1) % nm];
+        let denom = alpha - 2.0 * beta + gamma;
+        let frac = if denom.abs() > 1e-20 {
+            (0.5 * (alpha - gamma) / denom).clamp(-0.5, 0.5)
+        } else {
+            0.0
+        };
+        let peak = beta.sqrt();
+        let noise_mean = ((sum - beta) / (nm as f32 - 1.0)).max(1e-20).sqrt();
+        Some((best_bin as f32 + frac, peak, noise_mean))
+    }
 }
 
 impl Modem for CssModem {
@@ -204,39 +255,74 @@ impl Modem for CssModem {
         // 1. Грубая энергетическая детекция фронта преамбулы (коротким окном — острее).
         let edge = coarse_frame_edge(&bb, self.sps)?;
 
-        // 2. Точная временная привязка: сдвиг таймингов виден как сдвиг бина при дечирпе
-        //    upchirp-преамбулы. Окна берём заведомо ВНУТРИ преамбулы (edge+sp+k·sps),
-        //    чтобы не захватить фронт/тишину, и усредняем для устойчивости к шуму.
-        let mut delta_acc = 0i64;
-        let mut used = 0i64;
-        for k in 0..4usize {
+        // 2. Точная временная привязка + компенсация рассинхрона тактовой частоты (SFO).
+        //    Сдвиг тайминга виден как сдвиг бина при дечирпе up-chirp преамбулы. Меряем
+        //    смещение в НЕСКОЛЬКИХ окнах преамбулы с СУБ-БИННОЙ (параболической) точностью
+        //    и делаем взвешенную линейную аппроксимацию: свободный член — начальное
+        //    выравнивание, наклон — скорость дрейфа (шаг символа приёмника ≠ передатчика).
+        //    Суб-биновая интерполяция обязательна: разрешение по целому бину — fs/BW = 8
+        //    сэмплов, а дрейф за преамбулу — доли сэмпла, иначе его не увидеть. Наклон
+        //    применяем осторожно (ограничен разумным диапазоном ppm), чтобы шумная оценка
+        //    под реверберацией не сдвинула сетку сильнее, чем сам дрейф. Окна k — внутри
+        //    up-chirp части (с запасом на неточность фронта), чтобы не зацепить down-chirp.
+        let (mut sx, mut sy, mut sxx, mut sxy, mut n) = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        for k in 0..(PREAMBLE_UP - 2) {
             let off = edge + (k + 1) * self.sps;
             if off + self.sps > bb.len() {
                 break;
             }
-            let (bin, peak, noise) = self.demod_symbol(&bb, off);
+            let Some((frac_bin, peak, noise)) = self.demod_symbol_frac(&bb, off) else {
+                continue;
+            };
             if peak < noise * 4.0 {
                 continue; // слот не похож на чистый up-chirp
             }
-            let signed = if (bin as usize) > self.n_sym / 2 {
-                bin as i64 - self.n_sym as i64
+            let signed = if frac_bin > self.n_sym as f32 / 2.0 {
+                frac_bin - self.n_sym as f32
             } else {
-                bin as i64
+                frac_bin
             };
-            delta_acc += signed * self.sps as i64 / self.n_sym as i64;
-            used += 1;
+            let o = signed * self.sps as f32 / self.n_sym as f32; // смещение в сэмплах
+            let x = (k + 1) as f32;
+            sx += x;
+            sy += o;
+            sxx += x * x;
+            sxy += x * o;
+            n += 1.0;
         }
-        if used == 0 {
+        if n < 1.0 {
             return None;
         }
-        let delta = delta_acc / used;
-        let start = (edge as i64 - delta).max(0) as usize;
+        // o(x) = a + b·x: a = (edge − U) начальное смещение, b = −sps·ppm дрейф/символ.
+        let (a, mut b) = if n >= 3.0 {
+            let denom = n * sxx - sx * sx;
+            if denom.abs() < 1e-3 {
+                (sy / n, 0.0)
+            } else {
+                let slope = (n * sxy - sx * sy) / denom;
+                ((sy - slope * sx) / n, slope)
+            }
+        } else {
+            (sy / n, 0.0)
+        };
+        // Ограничиваем наклон эквивалентом ~±400 ppm: за пределами это уже не дрейф, а
+        // шумовой выброс оценки (например, из-за реверберации), которому нельзя доверять.
+        let max_b = self.sps as f32 * 400e-6;
+        b = b.clamp(-max_b, max_b);
+        let u = edge as f32 - a; // истинное начало преамбулы
+        let sps_rx = self.sps as f32 - b; // дрифтованный шаг символа приёмника
+        // Позиция символа с глобальным индексом j (0 = первый up-chirp), с учётом дрейфа.
+        let read_pos = |j: usize| -> Option<usize> {
+            let p = (u + j as f32 * sps_rx).round();
+            if p < 0.0 || p as usize + self.sps > bb.len() {
+                return None;
+            }
+            Some(p as usize)
+        };
 
         // 3. Проверка sync-символа (защита от ложного захвата на шуме/музыке).
-        let sync_off = start + (PREAMBLE_UP + PREAMBLE_DOWN) * self.sps;
-        if sync_off + self.sps > bb.len() {
-            return None;
-        }
+        let sync_j = PREAMBLE_UP + PREAMBLE_DOWN;
+        let sync_off = read_pos(sync_j)?;
         let (sync_val, peak, noise) = self.demod_symbol(&bb, sync_off);
         if sync_val != MAGIC_SYNC {
             return None;
@@ -245,15 +331,12 @@ impl Modem for CssModem {
 
         // 4. Длина кадра: LEN_REPS повторов, мажоритарное голосование по каждому символу.
         let len_syms = self.len_syms();
-        let len_base = sync_off + SYNC_SYMS * self.sps;
-        if len_base + LEN_REPS * len_syms * self.sps > bb.len() {
-            return None;
-        }
+        let len_j0 = sync_j + SYNC_SYMS;
         let mut len_symbols = Vec::with_capacity(len_syms);
         for pos in 0..len_syms {
             let mut votes = [0u16; LEN_REPS];
             for (rep, vote) in votes.iter_mut().enumerate() {
-                let off = len_base + (rep * len_syms + pos) * self.sps;
+                let off = read_pos(len_j0 + rep * len_syms + pos)?;
                 *vote = self.demod_symbol(&bb, off).0;
             }
             len_symbols.push(majority(&votes));
@@ -267,24 +350,41 @@ impl Modem for CssModem {
             return None; // неправдоподобная длина — считаем захват ложным
         }
 
-        // 5. Тело кадра.
-        let body_base = len_base + LEN_REPS * len_syms * self.sps;
+        // 5. Тело кадра со СЛЕЖЕНИЕМ ЗА ТАЙМИНГОМ (decision-directed timing recovery).
+        //    Преамбула — слишком короткая база, чтобы точно оценить дрейф, влияющий на
+        //    весь длинный кадр, поэтому здесь замыкаем петлю: символ CSS всегда садится на
+        //    ЦЕЛЫЙ бин, значит дробный остаток пика (параболическая интерполяция) — это
+        //    чистая ошибка тайминга. Ею подтягиваем позицию каждого следующего символа,
+        //    не давая дрейфу накопиться сверх ±0.5 бина. Так CSS держит рассинхрон
+        //    тактовой частоты (SFO) в сотни ppm, а не пару десятков.
+        let body_j0 = self.header_slots();
         let body_syms = self.body_syms(frame_len);
-        let body_end = body_base + body_syms * self.sps;
-        if body_end > bb.len() {
-            return None;
-        }
         let mut body_symbols = Vec::with_capacity(body_syms);
-        for i in 0..body_syms {
-            let off = body_base + i * self.sps;
-            body_symbols.push(self.demod_symbol(&bb, off).0);
+        let mut pos = u + body_j0 as f32 * sps_rx; // старт тела по дрейф-сетке (feedforward)
+        let mut last_off = sync_off;
+        let scale = self.sps as f32 / self.n_sym as f32; // сэмплов на бин
+        for _ in 0..body_syms {
+            if pos < 0.0 || pos.round() as usize + self.sps > bb.len() {
+                return None;
+            }
+            let off = pos.round() as usize;
+            last_off = off;
+            let Some((frac_bin, _, _)) = self.demod_symbol_frac(&bb, off) else {
+                return None;
+            };
+            let sym = (frac_bin.round() as i64).rem_euclid(self.n_sym as i64) as u16;
+            body_symbols.push(sym);
+            // Ошибка тайминга = дробный остаток относительно целого бина символа: >0 —
+            // читаем ПОЗЖЕ символа (нужно сдвинуться раньше), поэтому вычитаем коррекцию.
+            let residual = frac_bin - frac_bin.round(); // бины, [-0.5, 0.5]
+            pos += self.sps as f32 - 0.35 * residual * scale; // номинальный шаг + слежение
         }
         let bytes = symbols_to_bytes(&body_symbols, self.sf, frame_len);
 
         Some(Demodulated {
             bytes,
-            start_sample: start,
-            end_sample: body_end,
+            start_sample: u.max(0.0) as usize,
+            end_sample: last_off + self.sps,
             snr_db,
         })
     }

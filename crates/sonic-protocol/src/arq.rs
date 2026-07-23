@@ -19,12 +19,27 @@ pub struct ArqConfig {
 }
 
 impl ArqConfig {
-    /// Окно под режим: CSS медленный (окно 4), OFDM быстрый (окно 32) — PROTOCOL.md §7.3.
-    pub fn for_mode(mode: PhyMode, rtt_ms: f32) -> Self {
-        let window = if mode.is_ofdm() { 32 } else { 4 };
+    /// Окно и таймаут под режим (PROTOCOL.md §7.3). Окно: OFDM быстрый (32), MFSK (8),
+    /// CSS медленный (4).
+    ///
+    /// `frame_airtime_ms` — сколько времени ОДИН кадр данных реально звучит в эфире в
+    /// этом режиме. Это критично: у медленных режимов кадр длится секунды (CSS ~3–5 с),
+    /// и фиксированный таймаут 300 мс приводил к тому, что отправитель считал кадр
+    /// потерянным ещё до конца его проигрывания — заваливал очередь ретрансмиссиями и
+    /// ложно объявлял LINK_DOWN, из-за чего связь по CSS «вообще не работала». Берём
+    /// максимум из 3·RTT и (передать кадр + принять ACK + запас).
+    pub fn for_mode(mode: PhyMode, rtt_ms: f32, frame_airtime_ms: f32) -> Self {
+        let window = match mode {
+            PhyMode::OfdmQpsk | PhyMode::Ofdm16Qam => 32,
+            PhyMode::Mfsk => 8,
+            PhyMode::Css => 4,
+        };
+        // 2·airtime покрывает и передачу кадра, и обратный ACK (ACK короче, но с запасом).
+        let airtime_floor = (2.0 * frame_airtime_ms + 600.0) as u64;
+        let timeout_ms = ((3.0 * rtt_ms) as u64).max(airtime_floor).max(300);
         ArqConfig {
             window,
-            timeout_ms: (3.0 * rtt_ms).max(300.0) as u64, // таймаут = 3×RTT (§7.3)
+            timeout_ms,
             max_retries: 8, // после 8 неудач подряд — LINK_DOWN (§7.3)
         }
     }
@@ -216,8 +231,8 @@ impl<T> ArqReceiver<T> {
 
 /// Авто-fallback режима по деградации канала (PROTOCOL.md §9, plan.md §2).
 ///
-/// Лестница режимов (сверху вниз — быстрее→надёжнее): 16-QAM → QPSK → CSS. При серии
-/// неудач ARQ спускаемся на ступень; после серии успехов (гистерезис, чтобы не
+/// Лестница режимов (сверху вниз — быстрее→надёжнее): 16-QAM → QPSK → MFSK → CSS. При
+/// серии неудач ARQ спускаемся на ступень; после серии успехов (гистерезис, чтобы не
 /// осциллировать) — поднимаемся обратно.
 pub struct AutoFallback {
     ladder: Vec<PhyMode>,
@@ -231,9 +246,14 @@ pub struct AutoFallback {
 impl AutoFallback {
     pub fn new() -> Self {
         AutoFallback {
-            ladder: vec![PhyMode::Ofdm16Qam, PhyMode::OfdmQpsk, PhyMode::Css],
+            ladder: vec![
+                PhyMode::Ofdm16Qam,
+                PhyMode::OfdmQpsk,
+                PhyMode::Mfsk,
+                PhyMode::Css,
+            ],
             // Стартуем с CSS: сессия начинается в самом надёжном режиме (PROTOCOL.md §9).
-            level: 2,
+            level: 3,
             consecutive_failures: 0,
             consecutive_successes: 0,
             fail_threshold: 3,    // 3 неподтверждённых кадра подряд → вниз (§9)
@@ -402,17 +422,22 @@ mod tests {
         fb.on_failure();
         assert!(fb.on_failure());
         assert_eq!(fb.current(), PhyMode::OfdmQpsk);
-        // ещё серия → CSS.
+        // ещё серия → MFSK.
+        fb.on_failure();
+        fb.on_failure();
+        assert!(fb.on_failure());
+        assert_eq!(fb.current(), PhyMode::Mfsk);
+        // ещё серия → CSS (дно лестницы).
         fb.on_failure();
         fb.on_failure();
         assert!(fb.on_failure());
         assert_eq!(fb.current(), PhyMode::Css);
 
-        // 5 успехов подряд → подъём обратно к QPSK.
+        // 5 успехов подряд → подъём обратно к MFSK.
         for _ in 0..4 {
             assert!(!fb.on_success());
         }
         assert!(fb.on_success());
-        assert_eq!(fb.current(), PhyMode::OfdmQpsk);
+        assert_eq!(fb.current(), PhyMode::Mfsk);
     }
 }

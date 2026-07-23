@@ -9,7 +9,8 @@ import { listen } from "@tauri-apps/api/event";
 
 type Role = "initiator" | "responder";
 type Profile = "audible" | "ultrasonic";
-type ModePolicy = "auto" | "css" | "ofdm";
+type ModePolicy = "auto" | "css" | "mfsk" | "ofdm-qpsk" | "ofdm-qam";
+type SelfTestMode = "css" | "mfsk" | "ofdm-qpsk" | "ofdm-qam";
 
 interface MessageReceived {
   text: string;
@@ -236,6 +237,7 @@ async function setMode(mode: ModePolicy) {
 function modeBadgeClass(mode: string): string {
   if (mode.startsWith("OFDM-16")) return "mode-16qam";
   if (mode.startsWith("OFDM")) return "mode-qpsk";
+  if (mode === "MFSK") return "mode-mfsk";
   if (mode === "CSS") return "mode-css";
   return "";
 }
@@ -348,6 +350,8 @@ function modeClass(mode: string): string {
   switch (mode) {
     case "CSS":
       return "mode-css";
+    case "MFSK":
+      return "mode-mfsk";
     case "OFDM_QPSK":
       return "mode-qpsk";
     case "OFDM_16QAM":
@@ -467,14 +471,25 @@ interface SelfTestReport {
   verdict: string;
 }
 
-async function runSelfTest(mode: "css" | "ofdm") {
+const SELFTEST_BUTTONS = [
+  "#selftest-css",
+  "#selftest-mfsk",
+  "#selftest-ofdm-qpsk",
+  "#selftest-ofdm-qam",
+];
+
+function setSelfTestBusy(busy: boolean) {
+  for (const sel of SELFTEST_BUTTONS) {
+    const btn = $<HTMLButtonElement>(sel);
+    if (btn) btn.disabled = busy;
+  }
+}
+
+async function runSelfTest(mode: SelfTestMode) {
   const statusEl = $("#selftest-status");
   const resultEl = $("#selftest-result");
-  const cssBtn = $<HTMLButtonElement>("#selftest-css");
-  const ofdmBtn = $<HTMLButtonElement>("#selftest-ofdm");
   if (!statusEl || !resultEl) return;
-  if (cssBtn) cssBtn.disabled = true;
-  if (ofdmBtn) ofdmBtn.disabled = true;
+  setSelfTestBusy(true);
   resultEl.innerHTML = "";
   statusEl.textContent = "Играем кадр и слушаем микрофон (~1–2 с)…";
   try {
@@ -494,15 +509,16 @@ async function runSelfTest(mode: "css" | "ofdm") {
   } catch (err) {
     statusEl.textContent = `Ошибка: ${err}`;
   } finally {
-    if (cssBtn) cssBtn.disabled = false;
-    if (ofdmBtn) ofdmBtn.disabled = false;
+    setSelfTestBusy(false);
   }
 }
 
 function wireTools() {
   $("#check-channel-btn")?.addEventListener("click", checkChannel);
   $("#selftest-css")?.addEventListener("click", () => runSelfTest("css"));
-  $("#selftest-ofdm")?.addEventListener("click", () => runSelfTest("ofdm"));
+  $("#selftest-mfsk")?.addEventListener("click", () => runSelfTest("mfsk"));
+  $("#selftest-ofdm-qpsk")?.addEventListener("click", () => runSelfTest("ofdm-qpsk"));
+  $("#selftest-ofdm-qam")?.addEventListener("click", () => runSelfTest("ofdm-qam"));
   const nicknameInput = $<HTMLInputElement>("#nickname-input");
   if (nicknameInput) nicknameInput.value = loadOrCreateNickname();
   $("#discover-btn")?.addEventListener("click", discoverDevices);

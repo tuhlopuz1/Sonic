@@ -8,7 +8,7 @@
 
 use sonic_protocol::bandplan::{DuplexScheme, Fdd, Profile, Role};
 use sonic_protocol::modem::qam::Modulation;
-use sonic_protocol::modem::{CssModem, Modem, OfdmModem};
+use sonic_protocol::modem::{CssModem, MfskModem, Modem, OfdmModem};
 use sonic_protocol::sim::Rng;
 
 const TRIALS: usize = 40;
@@ -20,11 +20,13 @@ fn main() {
     let sr = fdd.sample_rate();
 
     let css = CssModem::with_defaults(band, sr);
+    let mfsk = MfskModem::new(band, sr);
     let ofdm_qpsk = OfdmModem::new(band, sr, Modulation::Qpsk);
     let ofdm_16 = OfdmModem::new(band, sr, Modulation::Qam16);
 
-    let modems: [(&str, &dyn Modem); 3] = [
+    let modems: [(&str, &dyn Modem); 4] = [
         ("CSS (SF8)", &css),
+        ("MFSK (M16)", &mfsk),
         ("OFDM-QPSK", &ofdm_qpsk),
         ("OFDM-16QAM", &ofdm_16),
     ];

@@ -4,6 +4,7 @@
 use crate::channel_check::AudioSelection;
 use crate::session::{ModePolicy, SessionHandle};
 use crate::state::AppState;
+use sonic_protocol::framing::PhyMode;
 use sonic_protocol::{Profile, Role};
 use tauri::State;
 
@@ -26,8 +27,10 @@ fn parse_role(s: &str) -> Result<Role, String> {
 fn parse_mode(s: &str) -> Result<ModePolicy, String> {
     match s.to_ascii_lowercase().as_str() {
         "auto" => Ok(ModePolicy::Auto),
-        "css" => Ok(ModePolicy::ForceCss),
-        "ofdm" => Ok(ModePolicy::ForceOfdm),
+        "css" => Ok(ModePolicy::Force(PhyMode::Css)),
+        "mfsk" => Ok(ModePolicy::Force(PhyMode::Mfsk)),
+        "ofdm" | "ofdm-qpsk" | "qpsk" => Ok(ModePolicy::Force(PhyMode::OfdmQpsk)),
+        "ofdm-qam" | "ofdm-16qam" | "16qam" | "qam" => Ok(ModePolicy::Force(PhyMode::Ofdm16Qam)),
         other => Err(format!("Неизвестный режим: {other}")),
     }
 }
@@ -125,9 +128,10 @@ pub fn modem_self_test(
     output_device: Option<String>,
 ) -> Result<crate::self_test::SelfTestReport, String> {
     let mode = match mode.to_ascii_lowercase().as_str() {
-        "css" => sonic_protocol::framing::PhyMode::Css,
-        "ofdm" | "ofdm-qpsk" | "qpsk" => sonic_protocol::framing::PhyMode::OfdmQpsk,
-        "ofdm-16qam" | "16qam" => sonic_protocol::framing::PhyMode::Ofdm16Qam,
+        "css" => PhyMode::Css,
+        "mfsk" => PhyMode::Mfsk,
+        "ofdm" | "ofdm-qpsk" | "qpsk" => PhyMode::OfdmQpsk,
+        "ofdm-qam" | "ofdm-16qam" | "16qam" | "qam" => PhyMode::Ofdm16Qam,
         other => return Err(format!("Неизвестный режим: {other}")),
     };
     crate::self_test::run(mode, &selection(input_device, output_device))

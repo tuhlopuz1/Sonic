@@ -262,11 +262,13 @@ pub(crate) fn analyze(noise_samples: &[f32], tone_samples: &[f32], sample_rate: 
     }
 }
 
-/// Пороги и оценки скорости — см. `PROTOCOL.md` §4 (CSS SF8 ≈ 50 бит/с) и §5.1
-/// (OFDM: 120 поднесущих × бит/символ / 24мс на полосу).
+/// Пороги и оценки скорости. CSS SF8/BW6000 ≈ 187 бит/с (после ускорения), MFSK ≈ 214
+/// бит/с (тоны, некогерентный приём), OFDM: ~120 поднесущих × бит/символ / 24мс.
 pub(crate) fn select_mode(snr_db: f32) -> (&'static str, &'static str, u32) {
-    if snr_db < 8.0 {
-        ("CSS", "CSS (Chirp Spread Spectrum) — максимальная надёжность", 50)
+    if snr_db < 4.0 {
+        ("CSS", "CSS (Chirp Spread Spectrum) — максимальная надёжность", 187)
+    } else if snr_db < 9.0 {
+        ("MFSK", "MFSK (тоновая манипуляция) — надёжный, устойчив к дрейфу", 214)
     } else if snr_db < 15.0 {
         ("OFDM_QPSK", "OFDM + QPSK — сбалансированный режим", 10_000)
     } else if snr_db < 25.0 {

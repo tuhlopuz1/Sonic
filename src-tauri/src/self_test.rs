@@ -15,7 +15,7 @@ use sonic_audio::streams::{build_input_stream, build_output_stream};
 use sonic_protocol::bandplan::Profile;
 use sonic_protocol::framing::{Frame, FrameHeader, FrameType, PhyMode};
 use sonic_protocol::modem::qam::Modulation;
-use sonic_protocol::modem::{CssModem, Modem, OfdmModem};
+use sonic_protocol::modem::{CssModem, MfskModem, Modem, OfdmModem};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -40,6 +40,7 @@ pub struct SelfTestReport {
 fn build_modem(mode: PhyMode, band: sonic_protocol::bandplan::SubBand) -> Box<dyn Modem> {
     match mode {
         PhyMode::Css => Box::new(CssModem::with_defaults(band, DSP_RATE)),
+        PhyMode::Mfsk => Box::new(MfskModem::new(band, DSP_RATE)),
         PhyMode::OfdmQpsk => Box::new(OfdmModem::new(band, DSP_RATE, Modulation::Qpsk)),
         PhyMode::Ofdm16Qam => Box::new(OfdmModem::new(band, DSP_RATE, Modulation::Qam16)),
     }
@@ -61,8 +62,9 @@ pub fn run(mode: PhyMode, selection: &AudioSelection) -> Result<SelfTestReport, 
     let band = Profile::Audible.band_plan().lower;
     let modem = build_modem(mode, band);
 
-    // Тестовый кадр.
-    let payload = b"SONIC self-test loopback frame 0123456789".to_vec();
+    // Тестовый кадр. Payload короткий: у медленных режимов (CSS/MFSK) длина кадра прямо
+    // определяет длительность самотеста, а для проверки тракта хватает пары слов.
+    let payload = b"SONIC self-test".to_vec();
     let frame = Frame::new(FrameHeader::new(mode, FrameType::Data, 0), payload);
     let frame_bytes = frame.serialize();
 
@@ -160,10 +162,5 @@ fn verdict(detected: bool, matched: bool, peak: f32, snr_db: f32) -> String {
 }
 
 fn mode_label(mode: PhyMode) -> String {
-    match mode {
-        PhyMode::Css => "CSS",
-        PhyMode::OfdmQpsk => "OFDM-QPSK",
-        PhyMode::Ofdm16Qam => "OFDM-16QAM",
-    }
-    .into()
+    mode.label().into()
 }

@@ -367,9 +367,19 @@ button.send {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  flex-wrap: wrap;
 }
 .chat-controls .segmented {
-  flex: 1;
+  flex: 1 1 260px;
+}
+/* Пять режимов (Auto/CSS/MFSK/OFDM·QPSK/OFDM·QAM) — компактнее, чтобы влезли на телефоне. */
+#mode-seg button {
+  padding: 6px 6px;
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+.chat-controls #stop-btn {
+  flex: 0 0 auto;
 }
 
 /* ── Mode badges (общие) ────────────────────────────── */
@@ -382,6 +392,10 @@ button.send {
 .mode-badge.mode-css {
   background: rgba(67, 97, 238, 0.16);
   color: var(--accent);
+}
+.mode-badge.mode-mfsk {
+  background: rgba(155, 89, 224, 0.18);
+  color: #7b3fc4;
 }
 .mode-badge.mode-qpsk {
   background: rgba(36, 200, 219, 0.18);
@@ -514,6 +528,16 @@ button.send {
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 4px;
+}
+/* Кнопки самотеста: сетка 2×2, чтобы 4 режима поместились аккуратно. */
+.selftest-buttons {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 4px;
+}
+.selftest-buttons button {
+  min-width: 0;
 }
 .row-2p input {
   flex: 1;

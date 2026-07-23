@@ -107,9 +107,11 @@
 
         <div class="chat-controls">
           <div class="segmented small" id="mode-seg">
-            <button type="button" data-mode="auto" class="active">Auto</button>
-            <button type="button" data-mode="css">CSS</button>
-            <button type="button" data-mode="ofdm">OFDM</button>
+            <button type="button" data-mode="auto" class="active" title="Авто-подбор режима по качеству канала">Auto</button>
+            <button type="button" data-mode="css" title="CSS (чирп) — максимальная надёжность">CSS</button>
+            <button type="button" data-mode="mfsk" title="MFSK (тоны) — надёжный, устойчив к дрейфу">MFSK</button>
+            <button type="button" data-mode="ofdm-qpsk" title="OFDM + QPSK — быстрый">OFDM·QPSK</button>
+            <button type="button" data-mode="ofdm-qam" title="OFDM + 16-QAM — самый быстрый">OFDM·QAM</button>
           </div>
           <button id="stop-btn" class="ghost">Завершить</button>
         </div>
@@ -128,9 +130,11 @@
             передача через реальный звук на этом устройстве. Прибавьте громкость и не
             заглушайте микрофон.
           </p>
-          <div class="row-2p">
+          <div class="selftest-buttons">
             <button id="selftest-css" type="button">Тест CSS</button>
-            <button id="selftest-ofdm" type="button">Тест OFDM</button>
+            <button id="selftest-mfsk" type="button">Тест MFSK</button>
+            <button id="selftest-ofdm-qpsk" type="button">Тест OFDM·QPSK</button>
+            <button id="selftest-ofdm-qam" type="button">Тест OFDM·QAM</button>
           </div>
           <p id="selftest-status" class="channel-status"></p>
           <div id="selftest-result" class="channel-result"></div>

@@ -17,8 +17,8 @@
 
 use sonic_protocol::bandplan::{DuplexScheme, EchoCanceller, SubBand};
 use sonic_protocol::modem::qam::Modulation;
-use sonic_protocol::modem::{CssModem, Modem, OfdmModem};
-use sonic_protocol::framing::PhyMode;
+use sonic_protocol::modem::{CssModem, MfskModem, Modem, OfdmModem};
+use sonic_protocol::framing::{Frame, PhyMode};
 
 /// Событие приёма кадра из эфира (сырые байты кадра до разбора framing).
 #[derive(Debug, Clone)]
@@ -28,10 +28,12 @@ pub struct RxEvent {
     pub mode: PhyMode,
 }
 
-/// Строит полный набор демодуляторов для полосы (CSS + оба OFDM) — приёмник mode-agnostic.
+/// Строит полный набор демодуляторов для полосы (CSS + MFSK + оба OFDM) — приёмник
+/// mode-agnostic. У каждого свой sync-маркер, поэтому перекрёстных ложных срабатываний нет.
 fn build_modems(band: SubBand, sample_rate: u32) -> Vec<Box<dyn Modem>> {
     vec![
         Box::new(CssModem::with_defaults(band, sample_rate)),
+        Box::new(MfskModem::new(band, sample_rate)),
         Box::new(OfdmModem::new(band, sample_rate, Modulation::Qpsk)),
         Box::new(OfdmModem::new(band, sample_rate, Modulation::Qam16)),
     ]
@@ -135,9 +137,12 @@ impl RxDemodulator {
             );
         }
 
-        // Порог: заметно выше шумового пола, но с низким абсолютным минимумом (тихий
-        // микрофон не должен блокироваться навсегда).
-        let gate = (self.noise_rms * 3.0).max(0.004);
+        // Порог: выше шумового пола, но с низким абсолютным минимумом (тихий микрофон не
+        // должен блокироваться навсегда). Множитель 2× (а не 3×): по воздуху между двумя
+        // устройствами принятый сигнал бывает всего вдвое-втрое громче шума, и слишком
+        // жадный гейт вообще не давал демодулятору шанса. Сам гейт лишь экономит CPU —
+        // ложный кадр отсекают sync-маркеры модемов, а не этот порог.
+        let gate = (self.noise_rms * 2.0).max(0.0025);
         let has_signal = recent > gate;
         if !has_signal {
             // Тишина/шум — медленно обновляем оценку шумового пола и не демодулируем.
@@ -160,15 +165,22 @@ impl RxDemodulator {
             let mut found: Option<(RxEvent, usize)> = None;
             for m in &self.modems {
                 if let Some(d) = m.demodulate(&self.buf) {
-                    found = Some((
-                        RxEvent {
-                            bytes: d.bytes,
-                            snr_db: d.snr_db,
-                            mode: m.mode(),
-                        },
-                        d.end_sample,
-                    ));
-                    break;
+                    // Принимаем декод только если кадр проходит CRC (Frame::parse). Иначе
+                    // чужой модем (например, OFDM-16QAM на сигнале OFDM-QPSK — у них общая
+                    // преамбула) «захватил» бы кадр, выдал мусор и СРЕЗАЛ буфер до нужного
+                    // демодулятора — настоящий кадр терялся бы. CRC-проверка снимает
+                    // неоднозначность: неверная модуляция → мусорные байты → CRC не сойдётся.
+                    if Frame::parse(&d.bytes).is_ok() {
+                        found = Some((
+                            RxEvent {
+                                bytes: d.bytes,
+                                snr_db: d.snr_db,
+                                mode: m.mode(),
+                            },
+                            d.end_sample,
+                        ));
+                        break;
+                    }
                 }
             }
             match found {
@@ -205,6 +217,7 @@ impl RxDemodulator {
 /// Передатчик: кэширует TX-модемы (дорогие FFT-планы/таблицы чирпов строятся один раз).
 pub struct Transmitter {
     css: CssModem,
+    mfsk: MfskModem,
     ofdm_qpsk: OfdmModem,
     ofdm_16: OfdmModem,
 }
@@ -216,6 +229,7 @@ impl Transmitter {
         let sr = scheme.sample_rate();
         Transmitter {
             css: CssModem::with_defaults(band, sr),
+            mfsk: MfskModem::new(band, sr),
             ofdm_qpsk: OfdmModem::new(band, sr, Modulation::Qpsk),
             ofdm_16: OfdmModem::new(band, sr, Modulation::Qam16),
         }
@@ -225,6 +239,7 @@ impl Transmitter {
     pub fn modulate(&self, mode: PhyMode, frame_bytes: &[u8]) -> Vec<f32> {
         match mode {
             PhyMode::Css => self.css.modulate(frame_bytes),
+            PhyMode::Mfsk => self.mfsk.modulate(frame_bytes),
             PhyMode::OfdmQpsk => self.ofdm_qpsk.modulate(frame_bytes),
             PhyMode::Ofdm16Qam => self.ofdm_16.modulate(frame_bytes),
         }

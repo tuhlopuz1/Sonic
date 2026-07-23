@@ -10,13 +10,16 @@
 //!
 //! Реализации:
 //! - [`CssModem`] — Chirp Spread Spectrum (LoRa-style), надёжный, PROTOCOL.md §4.
+//! - [`MfskModem`] — M-ичная FSK (некогерентные тоны), простой и устойчивый.
 //! - [`OfdmModem`] — OFDM+QAM (Schmidl-Cox, пилот-эквалайзер), быстрый, PROTOCOL.md §5.
 
 pub mod css;
+pub mod mfsk;
 pub mod ofdm;
 pub mod qam;
 
 pub use css::CssModem;
+pub use mfsk::MfskModem;
 pub use ofdm::OfdmModem;
 
 use crate::framing::PhyMode;

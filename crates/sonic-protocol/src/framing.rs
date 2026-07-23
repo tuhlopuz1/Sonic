@@ -20,13 +20,19 @@ use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 
 /// Режим модуляции payload. Дискриминант кладётся в заголовок (PROTOCOL.md §6.1, Mode).
+///
+/// Лестница «надёжно→быстро»: CSS (чирп, макс. processing gain) → MFSK (некогерентные
+/// тоны, быстрее, устойчив к сдвигам частоты/времени) → OFDM+QPSK → OFDM+16-QAM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PhyMode {
-    /// CSS — самый надёжный, стартовый режим (PROTOCOL.md §9).
+    /// CSS — Chirp Spread Spectrum, самый надёжный, стартовый режим (PROTOCOL.md §9).
     Css,
-    /// OFDM + QPSK — быстрый режим, первая ступень.
+    /// MFSK — M-ичная частотная манипуляция: некогерентный приём (пик FFT), проще и
+    /// быстрее CSS, очень устойчив к рассинхрону тактовой частоты и грубому таймингу.
+    Mfsk,
+    /// OFDM + QPSK — быстрый режим, фазовая манипуляция поднесущих (устойчив к AGC).
     OfdmQpsk,
-    /// OFDM + 16-QAM — самый быстрый из реализованных.
+    /// OFDM + 16-QAM — самый быстрый из реализованных (амплитудно-фазовое созвездие).
     Ofdm16Qam,
 }
 
@@ -34,20 +40,32 @@ impl PhyMode {
     pub fn to_bits(self) -> u8 {
         match self {
             PhyMode::Css => 0,
-            PhyMode::OfdmQpsk => 1,
-            PhyMode::Ofdm16Qam => 2,
+            PhyMode::Mfsk => 1,
+            PhyMode::OfdmQpsk => 2,
+            PhyMode::Ofdm16Qam => 3,
         }
     }
     pub fn from_bits(b: u8) -> Option<Self> {
         match b {
             0 => Some(PhyMode::Css),
-            1 => Some(PhyMode::OfdmQpsk),
-            2 => Some(PhyMode::Ofdm16Qam),
+            1 => Some(PhyMode::Mfsk),
+            2 => Some(PhyMode::OfdmQpsk),
+            3 => Some(PhyMode::Ofdm16Qam),
             _ => None,
         }
     }
     pub fn is_ofdm(self) -> bool {
-        !matches!(self, PhyMode::Css)
+        matches!(self, PhyMode::OfdmQpsk | PhyMode::Ofdm16Qam)
+    }
+
+    /// Человекочитаемая метка для UI/логов.
+    pub fn label(self) -> &'static str {
+        match self {
+            PhyMode::Css => "CSS",
+            PhyMode::Mfsk => "MFSK",
+            PhyMode::OfdmQpsk => "OFDM-QPSK",
+            PhyMode::Ofdm16Qam => "OFDM-16QAM",
+        }
     }
 }
 
