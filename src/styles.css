@@ -602,3 +602,100 @@ button.send {
   font-size: 0.8rem;
   margin-bottom: 12px;
 }
+
+/* ── Живая аудио-диагностика приёмника ──────────────────────────────────────── */
+.rx-debug {
+  margin: 4px 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: var(--card-2);
+  font-size: 12px;
+}
+.rx-debug > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 600;
+  user-select: none;
+}
+.rx-meter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0 8px;
+}
+.rx-bar-track {
+  position: relative;
+  flex: 1;
+  height: 16px;
+  background: rgba(20, 22, 28, 0.08);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.rx-bar-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0%;
+  background: var(--muted);
+  border-radius: 8px;
+  transition: width 0.12s linear;
+}
+.rx-bar-fill.hot {
+  background: linear-gradient(90deg, var(--accent-2), var(--ok));
+}
+.rx-gate-line {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  background: var(--warn);
+  transition: left 0.2s linear;
+}
+.rx-peak-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: rgba(20, 22, 28, 0.55);
+  transition: left 0.12s linear;
+}
+.rx-badge {
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 10px;
+  background: rgba(20, 22, 28, 0.08);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.rx-badge.hot {
+  background: rgba(46, 204, 113, 0.16);
+  color: #1e9e57;
+}
+.rx-badge.tx {
+  background: rgba(232, 145, 45, 0.18);
+  color: var(--warn);
+}
+.rx-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  color: var(--muted);
+}
+.rx-stats b {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.rx-stats b.ok {
+  color: var(--ok);
+}
+.rx-stats b.bad {
+  color: var(--danger);
+}
+.rx-hint {
+  color: var(--muted);
+  font-size: 11px;
+  margin: 8px 0 2px;
+  line-height: 1.45;
+}

@@ -26,9 +26,9 @@
         <h2>Начать сессию</h2>
         <p class="hint">
           Передача данных звуком без сети. Оба устройства работают в одной полосе по очереди
-          (полудуплекс), а роль <b>A</b>/<b>B</b> помечает, чьи это кадры. Запустите на двух
-          устройствах рядом и обязательно выберите <b>разные</b> роли — иначе они примут кадры
-          друг друга за собственное эхо и не увидят пира.
+          (полудуплекс) и сами различают друг друга по случайному id. Просто запустите сессию на
+          двух устройствах рядом. Роли согласовывать не обязательно, но если выбрать <b>разные</b>
+          (одно A, другое B) — различение гарантировано.
         </p>
 
         <div class="field">
@@ -93,6 +93,32 @@
             <span class="tele-value" id="tele-inflight">0</span>
           </div>
         </div>
+
+        <details class="rx-debug" id="rx-debug" open>
+          <summary>🎧 Аудио-диагностика — что слышит микрофон</summary>
+          <div class="rx-meter">
+            <div class="rx-bar-track">
+              <div class="rx-bar-fill" id="rx-bar"></div>
+              <div class="rx-gate-line" id="rx-gate-line" title="порог детекции"></div>
+              <div class="rx-peak-line" id="rx-peak-line" title="пик"></div>
+            </div>
+            <span class="rx-badge" id="rx-state">ожидание</span>
+          </div>
+          <div class="rx-stats">
+            <span>RMS <b id="rx-rms">—</b></span>
+            <span>пик <b id="rx-peak">—</b></span>
+            <span>шум <b id="rx-noise">—</b></span>
+            <span>гейт <b id="rx-gate">—</b></span>
+            <span>буфер <b id="rx-buf">—</b></span>
+            <span>кадры <b class="ok" id="rx-ok">0</b>/<b class="bad" id="rx-bad">0</b></span>
+            <span>SNR <b id="rx-snr">—</b></span>
+          </div>
+          <p class="rx-hint" id="rx-hint">
+            Зелёная полоса выше засечки-гейта = микрофон слышит кадр. Если полоса всегда ниже
+            гейта — прибавьте громкость/сдвиньте устройства. Если ✗ растёт — сигнал ловится, но
+            слишком шумно (искажения/громкость).
+          </p>
+        </details>
 
         <div class="messages" id="messages">
           <div class="empty-hint" id="empty-hint">

@@ -12,5 +12,5 @@ pub mod resample;
 pub mod streams;
 
 pub use device::{list_devices, DeviceList};
-pub use duplex::{DuplexEngine, EngineConfig};
-pub use pipeline::{RxDemodulator, RxEvent, Transmitter};
+pub use duplex::{DuplexEngine, EngineConfig, EngineDebug};
+pub use pipeline::{RxDemodulator, RxEvent, RxStats, Transmitter};

@@ -2,10 +2,14 @@
 //!
 //! Кадр (байтовый уровень, ср. PROTOCOL.md §6/§7.2):
 //! ```text
-//! ┌──────────────── header (11 байт) ────────────────┬─ payload ─┬─ CRC32 ─┐
-//! │ magic ver|mode type|dir  seq   ack   sack_bitmap │   …       │  tail   │
-//! └───────────────────────────────────────────────────┴──────────┴─────────┘
+//! ┌──────────────── header (12 байт) ─────────────────┬─ payload ─┬─ CRC32 ─┐
+//! │ magic ver|mode type  src   seq   ack   sack_bitmap │   …       │  tail   │
+//! └────────────────────────────────────────────────────┴──────────┴─────────┘
 //! ```
+//! `src` — случайный идентификатор устройства на сессию: приёмник ИГНОРИРУЕТ кадры со СВОИМ
+//! `src` (это своё эхо) и принимает кадры с ЧУЖИМ `src` (это пир). Так связь работает без
+//! согласования ролей: два устройства почти наверняка выберут разные src (а разные роли —
+//! гарантированно, роль задаёт старший бит).
 //! Этот байтовый кадр — единица, которую модулятор ([`crate::modem`]) кладёт в эфир.
 //! Заголовок робастный и mode-agnostic: поле `mode` говорит, каким FEC закодирован
 //! payload, поэтому приёмнику не нужно заранее знать режим (основа auto-fallback,
@@ -112,7 +116,7 @@ impl FrameType {
 
 const MAGIC: u8 = 0x2B;
 const VERSION: u8 = 1;
-pub const HEADER_LEN: usize = 11;
+pub const HEADER_LEN: usize = 12;
 pub const CRC_LEN: usize = 4;
 pub const OVERHEAD: usize = HEADER_LEN + CRC_LEN;
 
@@ -121,8 +125,10 @@ pub const OVERHEAD: usize = HEADER_LEN + CRC_LEN;
 pub struct FrameHeader {
     pub mode: PhyMode,
     pub frame_type: FrameType,
-    /// Направление A→B (0) / B→A (1) — защита от приёма собственного эха через guard band.
-    pub direction: u8,
+    /// Идентификатор устройства-отправителя (случайный на сессию). Приёмник отбрасывает
+    /// кадры со своим `src` (собственное эхо) и принимает кадры с чужим `src` (пир). Заменяет
+    /// прежний бит направления: связь больше не требует согласования ролей вручную.
+    pub src: u8,
     /// Номер кадра отправителя (ARQ).
     pub seq: u16,
     /// Кумулятивный ACK: последний подряд принятый seq пира.
@@ -132,11 +138,11 @@ pub struct FrameHeader {
 }
 
 impl FrameHeader {
-    pub fn new(mode: PhyMode, frame_type: FrameType, direction: u8) -> Self {
+    pub fn new(mode: PhyMode, frame_type: FrameType, src: u8) -> Self {
         FrameHeader {
             mode,
             frame_type,
-            direction: direction & 1,
+            src,
             seq: 0,
             ack: 0,
             sack: 0,
@@ -171,7 +177,8 @@ impl Frame {
         let mut out = Vec::with_capacity(OVERHEAD + self.payload.len());
         out.push(MAGIC);
         out.push((VERSION << 4) | (h.mode.to_bits() & 0x0F));
-        out.push((h.frame_type.to_bits() << 1) | (h.direction & 1));
+        out.push(h.frame_type.to_bits());
+        out.push(h.src);
         out.extend_from_slice(&h.seq.to_be_bytes());
         out.extend_from_slice(&h.ack.to_be_bytes());
         out.extend_from_slice(&h.sack.to_be_bytes());
@@ -209,18 +216,18 @@ impl Frame {
         }
 
         let mode = PhyMode::from_bits(bytes[1] & 0x0F).ok_or(FramingError::BadField)?;
-        let frame_type = FrameType::from_bits(bytes[2] >> 1).ok_or(FramingError::BadField)?;
-        let direction = bytes[2] & 1;
-        let seq = u16::from_be_bytes([bytes[3], bytes[4]]);
-        let ack = u16::from_be_bytes([bytes[5], bytes[6]]);
-        let sack = u32::from_be_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]);
+        let frame_type = FrameType::from_bits(bytes[2]).ok_or(FramingError::BadField)?;
+        let src = bytes[3];
+        let seq = u16::from_be_bytes([bytes[4], bytes[5]]);
+        let ack = u16::from_be_bytes([bytes[6], bytes[7]]);
+        let sack = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         let payload = bytes[HEADER_LEN..body_len].to_vec();
 
         Ok(Frame {
             header: FrameHeader {
                 mode,
                 frame_type,
-                direction,
+                src,
                 seq,
                 ack,
                 sack,

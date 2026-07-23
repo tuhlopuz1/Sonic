@@ -33,6 +33,18 @@ interface LinkQuality {
 interface SessionStateChanged {
   state: "up" | "down";
 }
+interface RxDebug {
+  rms: number;
+  peak: number;
+  noise_floor: number;
+  gate: number;
+  buffer_secs: number;
+  in_burst: boolean;
+  tx_active: boolean;
+  frames_ok: number;
+  frames_bad: number;
+  last_snr_db: number;
+}
 interface AudioDevices {
   inputs: string[];
   outputs: string[];
@@ -259,6 +271,52 @@ function renderTelemetry(q: LinkQuality) {
   set("#tele-inflight", String(q.in_flight));
 }
 
+// Живая аудио-диагностика: показывает, что реально слышит микрофон, где порог детекции и
+// сколько кадров ловится/бьётся. Уровни малые (шум ~0.004, кадр ~0.05–0.3), поэтому шкалу
+// сжимаем sqrt'ом — так и тихий сигнал, и громкий видны на одной полосе.
+const RX_SCALE_MAX = 0.35;
+function rxScale(v: number): number {
+  const x = Math.sqrt(Math.max(0, Math.min(v, RX_SCALE_MAX)) / RX_SCALE_MAX);
+  return Math.min(100, x * 100);
+}
+function renderRxDebug(d: RxDebug) {
+  const set = (sel: string, val: string) => {
+    const el = $(sel);
+    if (el) el.textContent = val;
+  };
+  const bar = $("#rx-bar");
+  const gateLine = $("#rx-gate-line");
+  const peakLine = $("#rx-peak-line");
+  const badge = $("#rx-state");
+  if (bar) bar.style.width = `${rxScale(d.rms)}%`;
+  if (gateLine) gateLine.style.left = `${rxScale(d.gate)}%`;
+  if (peakLine) peakLine.style.left = `${rxScale(d.peak)}%`;
+
+  let state = "тихо";
+  let cls = "rx-badge";
+  if (d.tx_active) {
+    state = "📢 передаю";
+    cls = "rx-badge tx";
+  } else if (d.in_burst) {
+    state = "🔊 слышу сигнал";
+    cls = "rx-badge hot";
+  }
+  if (badge) {
+    badge.textContent = state;
+    badge.className = cls;
+  }
+  if (bar) bar.className = `rx-bar-fill${d.in_burst && !d.tx_active ? " hot" : ""}`;
+
+  set("#rx-rms", d.rms.toFixed(4));
+  set("#rx-peak", d.peak.toFixed(3));
+  set("#rx-noise", d.noise_floor.toFixed(4));
+  set("#rx-gate", d.gate.toFixed(4));
+  set("#rx-buf", `${d.buffer_secs.toFixed(1)}с`);
+  set("#rx-ok", String(d.frames_ok));
+  set("#rx-bad", String(d.frames_bad));
+  set("#rx-snr", d.last_snr_db !== 0 ? `${d.last_snr_db.toFixed(1)} дБ` : "—");
+}
+
 // ── Инициализация ─────────────────────────────────────────────────────────────
 
 function wireMessenger() {
@@ -304,6 +362,7 @@ function wireMessenger() {
   });
 
   listen<LinkQuality>("link-quality", (e) => renderTelemetry(e.payload));
+  listen<RxDebug>("rx-debug", (e) => renderRxDebug(e.payload));
 
   listen<SessionStateChanged>("session-state-changed", (e) => {
     if (e.payload.state === "up") setSessionUp(true);
