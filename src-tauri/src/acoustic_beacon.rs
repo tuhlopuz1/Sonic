@@ -12,8 +12,13 @@ const GUARD_MS: u64 = 25;
 const SYNC_SLOTS: usize = 3;
 const DATA_SLOTS: usize = NICK_MAX_LEN * 2; // 2 нибл-тона на байт никнейма
 const BEACON_SLOTS: usize = SYNC_SLOTS + DATA_SLOTS;
-const BASE_FREQ_HZ: f32 = 2000.0;
-const FREQ_STEP_HZ: f32 = 375.0; // 17 тонов: 0 = sync, 1..=16 = нибблы 0x0..0xF
+// Тоны маячка держим в «рабочей зоне» железа (~0.5–3.7 кГц) — там же, где идёт и сама связь.
+// Раньше лестница шла 2000…8000 Гц, и верхние тоны (нибблы 0x8..0xF) попадали в диапазон,
+// который реальные динамики/микрофоны уже заваливают: часть нибблов не декодировалась, из-за
+// чего ник приходил кусками. Разнос 170 Гц при слоте 110 мс (разрешение Гёрцеля ~9 Гц) даёт
+// огромный запас по разделимости тонов.
+const BASE_FREQ_HZ: f32 = 800.0;
+const FREQ_STEP_HZ: f32 = 170.0; // 17 тонов: 0 = sync, 1..=16 = нибблы 0x0..0xF (800…3520 Гц)
 const DOMINANCE_THRESHOLD: f32 = 4.0;
 const PAD_CHAR: u8 = b'_';
 
@@ -242,6 +247,19 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].nickname, "ALEX1");
         assert!(decoded[0].snr_db > 10.0, "snr_db = {}", decoded[0].snr_db);
+    }
+
+    /// Все тоны маячка обязаны лежать в «рабочей зоне» железа — иначе верхние нибблы не
+    /// декодируются и ник приходит кусками (ровно это и наблюдалось на телефонах).
+    #[test]
+    fn all_beacon_tones_stay_in_hardware_band() {
+        for i in 0..=16usize {
+            let f = tone_freq(i);
+            assert!(
+                (500.0..=3700.0).contains(&f),
+                "тон {i} = {f} Гц вне рабочей полосы железа"
+            );
+        }
     }
 
     #[test]

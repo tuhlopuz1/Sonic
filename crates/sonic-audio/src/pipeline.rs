@@ -49,6 +49,9 @@ pub struct RxStats {
     pub frames_bad: u32,
     /// SNR последнего успешного кадра.
     pub last_snr_db: f32,
+    /// Что случилось с последним обработанным всплеском — сразу видно, ГДЕ рвётся приём:
+    /// «преамбула не найдена» (тайминг/слишком тихо) vs «CRC битый» (сигнал есть, но шумно).
+    pub last_event: &'static str,
 }
 
 /// Строит полный набор демодуляторов для полосы (CSS + MFSK + оба OFDM) — приёмник
@@ -61,6 +64,13 @@ fn build_modems(band: SubBand, sample_rate: u32) -> Vec<Box<dyn Modem>> {
         Box::new(OfdmModem::new(band, sample_rate, Modulation::Qam16)),
     ]
 }
+
+/// Длина истории уровней для оценки шумового пола: 200 отсчётов × ~100 мс ≈ 20 c — заведомо
+/// длиннее самого длинного кадра, поэтому кадр не может «завладеть» оценкой.
+const LEVEL_HIST_LEN: usize = 200;
+/// Потолок шумового пола. Страховка от самозапирания приёмника: даже при пессимистичной оценке
+/// гейт (2.5×) остаётся ниже уровня сигнала устройства рядом.
+const NOISE_FLOOR_CAP: f32 = 0.03;
 
 /// Приёмный конвейер: копит захваченные сэмплы и выдаёт декодированные кадры.
 ///
@@ -81,8 +91,12 @@ pub struct RxDemodulator {
     /// Самый длинный ожидаемый кадр (CSS медленный) — предел буфера при непрерывной энергии.
     max_frame: usize,
     sample_rate: usize,
-    /// Оценка шумового пола: быстро вниз (садится к тишине), медленно вверх (всплеск не задирает).
+    /// Оценка шумового пола = низкий перцентиль по `level_hist` (см. `poll`).
     noise_rms: f32,
+    /// История уровней (отсчёт ~раз в 100 мс) для перцентильной оценки шумового пола.
+    level_hist: std::collections::VecDeque<f32>,
+    /// Счётчик сэмплов до следующей записи уровня в историю.
+    since_hist: usize,
     /// Троттлинг форс-демода очень длинного (непрерывно шумного) буфера.
     since_force: usize,
     /// Троттлинг диагностического лога уровня захвата.
@@ -94,6 +108,7 @@ pub struct RxDemodulator {
     frames_ok: u32,
     frames_bad: u32,
     last_snr_db: f32,
+    last_event: &'static str,
 }
 
 impl RxDemodulator {
@@ -115,6 +130,8 @@ impl RxDemodulator {
             max_frame,
             sample_rate: sr as usize,
             noise_rms: 0.0,
+            level_hist: std::collections::VecDeque::with_capacity(LEVEL_HIST_LEN),
+            since_hist: 0,
             since_force: 0,
             since_log: 0,
             stat_rms: 0.0,
@@ -123,6 +140,7 @@ impl RxDemodulator {
             frames_ok: 0,
             frames_bad: 0,
             last_snr_db: 0.0,
+            last_event: "ожидание",
         }
     }
 
@@ -138,6 +156,7 @@ impl RxDemodulator {
             frames_ok: self.frames_ok,
             frames_bad: self.frames_bad,
             last_snr_db: self.last_snr_db,
+            last_event: self.last_event,
         }
     }
 
@@ -170,6 +189,7 @@ impl RxDemodulator {
         self.canceller.process(&mut block, &refs);
         self.buf.extend_from_slice(&block);
         self.since_force += block.len();
+        self.since_hist += block.len();
         self.since_log += block.len();
     }
 
@@ -212,16 +232,35 @@ impl RxDemodulator {
 
         let (recent, peak) = self.tail_rms(sr / 8); // хвост ~125 мс для детекции паузы
 
-        // Шумовой пол: быстро вниз (садится к тишине), медленно вверх (всплеск не задирает).
-        if self.noise_rms <= 1e-9 {
-            self.noise_rms = recent.max(1e-6);
-        } else if recent < self.noise_rms {
-            self.noise_rms = 0.6 * self.noise_rms + 0.4 * recent;
-        } else {
-            self.noise_rms = 0.99 * self.noise_rms + 0.01 * recent;
+        // ШУМОВОЙ ПОЛ — НИЗКИЙ ПЕРЦЕНТИЛЬ ПО ДЛИННОМУ ОКНУ (~20 c), а не EWMA.
+        //
+        // Почему не EWMA: прежняя версия подтягивала пол вверх к текущему уровню и во время
+        // ПЕРЕДАЧИ тоже. За длинный кадр (CSS — секунды) пол успевал догнать уровень сигнала,
+        // гейт (кратный полу) вылезал ВЫШЕ сигнала — и приём вставал намертво: «сначала пару
+        // секунд ловит, потом сколько ни прибавляй громкость — тишина». Классический
+        // самозапирающийся AGC.
+        //
+        // Перцентиль устойчив по построению: всплески сигнала — это верхние перцентили окна, а
+        // 10-й перцентиль отражает именно паузы между кадрами (в полудуплексе они всегда есть).
+        // При этом в реально шумной комнате всё распределение уезжает вверх — и пол честно
+        // поднимется. Окно (~20 c) заведомо длиннее самого длинного кадра, поэтому даже
+        // семисекундный CSS-кадр не может им завладеть.
+        if self.since_hist >= sr / 10 {
+            self.since_hist = 0;
+            self.level_hist.push_back(recent);
+            while self.level_hist.len() > LEVEL_HIST_LEN {
+                self.level_hist.pop_front();
+            }
+            let mut v: Vec<f32> = self.level_hist.iter().copied().collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let idx = (v.len() / 10).min(v.len().saturating_sub(1));
+            // Абсолютный потолок пола — страховка «никогда не запереть себя»: как бы ни
+            // складывалась оценка, гейт не поднимется выше уровня, который заведомо перекрывает
+            // сигнал близкого устройства.
+            self.noise_rms = v[idx].min(NOISE_FLOOR_CAP);
         }
         // Гейт: выше шумового пола, но с разумным абсолютным минимумом.
-        let gate = (self.noise_rms * 3.0).max(0.006);
+        let gate = (self.noise_rms * 2.5).max(0.006);
         self.stat_rms = recent;
         self.stat_peak = peak;
         self.stat_gate = gate;
@@ -280,6 +319,7 @@ impl RxDemodulator {
     fn record_ok(&mut self, ev: &RxEvent) {
         self.frames_ok += 1;
         self.last_snr_db = ev.snr_db;
+        self.last_event = "кадр принят";
         eprintln!(
             "sonic-rx: ✓ кадр {:?} {}Б SNR {:.1}дБ (всего ok={})",
             ev.mode,
@@ -308,6 +348,11 @@ impl RxDemodulator {
             }
         }
         let secs = self.buf.len() as f32 / self.sample_rate as f32;
+        self.last_event = if detected_bad {
+            "синхронизация есть, CRC битый"
+        } else {
+            "преамбула не найдена"
+        };
         if detected_bad {
             self.frames_bad += 1;
             eprintln!(
@@ -443,23 +488,25 @@ mod tests {
         assert!(rx.poll().is_empty());
     }
 
+    /// Скармливает сэмплы приёмнику мелкими кусками с постоянным опросом — как в реальном
+    /// потоке; собирает декодированные полезные нагрузки.
+    fn feed(rx: &mut RxDemodulator, samples: &[f32], out: &mut Vec<String>) {
+        for chunk in samples.chunks(1024) {
+            rx.push_captured(chunk);
+            for ev in rx.poll() {
+                if let Ok(f) = Frame::parse(&ev.bytes) {
+                    out.push(String::from_utf8_lossy(&f.payload).into_owned());
+                }
+            }
+        }
+    }
+
     #[test]
     fn streaming_decodes_successive_frames_without_getting_stuck() {
         // Ключевая регрессия: реальный поток идёт мелкими кусками, poll крутится постоянно,
         // кадры разделены паузами. Раньше буфер рос и приёмник цеплялся за застрявший префикс
         // → второй (и часто первый) кадр не декодировался. Проверяем, что ДВА кадра подряд
         // проходят — значит forward progress есть, застрявшего буфера нет.
-        fn feed(rx: &mut RxDemodulator, samples: &[f32], out: &mut Vec<String>) {
-            for chunk in samples.chunks(1024) {
-                rx.push_captured(chunk);
-                for ev in rx.poll() {
-                    if let Ok(f) = Frame::parse(&ev.bytes) {
-                        out.push(String::from_utf8_lossy(&f.payload).into_owned());
-                    }
-                }
-            }
-        }
-
         let (initiator, responder) = peer_schemes();
         let tx = Transmitter::new(&initiator);
         let mut rx = RxDemodulator::new(&responder);
@@ -485,6 +532,59 @@ mod tests {
         assert!(
             decoded.iter().any(|s| s == "second frame here"),
             "второй кадр не декодирован — застрявший буфер: {decoded:?}"
+        );
+    }
+
+    #[test]
+    fn gate_does_not_creep_above_signal_over_long_session() {
+        // Регрессия на «сначала пару секунд ловит, а потом сколько ни прибавляй громкость —
+        // тишина». Причина была в EWMA-шумовом поле: он подтягивался вверх и ВО ВРЕМЯ сигнала,
+        // за длинный кадр догонял его уровень, гейт уезжал ВЫШЕ сигнала и запирал приём.
+        // Гоняем длинную серию кадров и требуем, чтобы ПОСЛЕДНИЕ принимались так же, как первые.
+        let (initiator, responder) = peer_schemes();
+        let tx = Transmitter::new(&initiator);
+        let mut rx = RxDemodulator::new(&responder);
+        let dir = initiator.role().direction_bit();
+        let silence = vec![0.0f32; 24_000]; // 0.5 c паузы
+
+        // Берём MFSK: его кадр звучит ~1.5 c. Это принципиально — прежняя EWMA-оценка
+        // подтягивалась к текущему уровню с постоянной ~0.5 c, поэтому уже после ~0.26 c
+        // НЕПРЕРЫВНОГО сигнала гейт перерастал сам сигнал. На коротком кадре баг не проявлялся,
+        // на длинном — приём запирался намертво.
+        const ROUNDS: usize = 6;
+        let mut decoded: Vec<String> = Vec::new();
+        for i in 0..ROUNDS {
+            let msg = format!("frame number {i}");
+            let frame = Frame::new(
+                FrameHeader::new(PhyMode::Mfsk, FrameType::Data, dir),
+                msg.clone().into_bytes(),
+            );
+            let sig = tx.modulate(PhyMode::Mfsk, &frame.serialize());
+            feed(&mut rx, &silence, &mut decoded);
+            feed(&mut rx, &sig, &mut decoded);
+            feed(&mut rx, &silence, &mut decoded);
+        }
+
+        let last = format!("frame number {}", ROUNDS - 1);
+        assert!(
+            decoded.iter().any(|s| s == &last),
+            "последний кадр не принят — гейт запер приём (принято {}/{ROUNDS}): {decoded:?}",
+            decoded.len()
+        );
+        assert_eq!(
+            decoded.len(),
+            ROUNDS,
+            "часть кадров потеряна по ходу сессии: {decoded:?}"
+        );
+
+        // Главный инвариант: гейт остаётся у уровня ТИШИНЫ и не подтягивается к уровню сигнала
+        // (у передаваемого кадра RMS ~0.2+). Именно нарушение этого запирало приём.
+        let st = rx.stats();
+        assert!(
+            st.gate < 0.05,
+            "гейт уехал к уровню сигнала: гейт={:.4}, пол={:.4}",
+            st.gate,
+            st.noise_floor
         );
     }
 

@@ -182,6 +182,7 @@ struct RxDebugEvent {
     frames_ok: u32,
     frames_bad: u32,
     last_snr_db: f32,
+    last_event: String,
 }
 
 fn mode_label(mode: PhyMode) -> &'static str {
@@ -379,6 +380,7 @@ fn session_loop(
                     frames_ok: d.rx.frames_ok,
                     frames_bad: d.rx.frames_bad,
                     last_snr_db: d.rx.last_snr_db,
+                    last_event: d.rx.last_event.to_string(),
                 },
             );
         }

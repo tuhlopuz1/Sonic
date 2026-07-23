@@ -44,6 +44,7 @@ interface RxDebug {
   frames_ok: number;
   frames_bad: number;
   last_snr_db: number;
+  last_event: string;
 }
 interface AudioDevices {
   inputs: string[];
@@ -315,6 +316,12 @@ function renderRxDebug(d: RxDebug) {
   set("#rx-ok", String(d.frames_ok));
   set("#rx-bad", String(d.frames_bad));
   set("#rx-snr", d.last_snr_db !== 0 ? `${d.last_snr_db.toFixed(1)} дБ` : "—");
+  set("#rx-last", d.last_event);
+  const lastEl = $("#rx-last");
+  if (lastEl) {
+    lastEl.className =
+      d.last_event === "кадр принят" ? "ok" : d.last_event === "ожидание" ? "" : "bad";
+  }
 }
 
 // ── Инициализация ─────────────────────────────────────────────────────────────
