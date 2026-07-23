@@ -43,7 +43,6 @@ pub struct MfskModem {
     center_hz: f32,
     sample_rate: f32,
     bw: f32,
-    tones: Vec<Vec<Complex32>>, // предрасчитанные baseband-бурсты для каждого символа
     fft: FftEngine,
 }
 
@@ -57,27 +56,17 @@ impl MfskModem {
         debug_assert!(span <= band.bandwidth_hz * 0.98, "MFSK tone span exceeds sub-band");
         let bw = span.min(band.bandwidth_hz * 0.98);
 
-        // Каждый символ — постоянный тон на своём бине, длиной SYM сэмплов.
-        let tones: Vec<Vec<Complex32>> = (0..M)
-            .map(|s| {
-                let bin = (s as i32 - (M as i32) / 2) * STRIDE;
-                let omega = 2.0 * PI * bin as f32 / SPS_FFT as f32;
-                (0..SYM)
-                    .map(|n| {
-                        let ph = omega * n as f32;
-                        Complex32::new(ph.cos(), ph.sin())
-                    })
-                    .collect()
-            })
-            .collect();
-
         MfskModem {
             center_hz: band.center_hz,
             sample_rate: sr,
             bw,
-            tones,
             fft: FftEngine::new(SPS_FFT),
         }
+    }
+
+    /// Бин baseband-тона для символа `s` (может быть отрицательным).
+    fn bin_of(s: u16) -> i32 {
+        (s as i32 - (M as i32) / 2) * STRIDE
     }
 
     fn len_syms(&self) -> usize {
@@ -103,7 +92,7 @@ impl MfskModem {
         let mut best = f32::MIN;
         let mut sum = 0.0f32;
         for s in 0..M {
-            let bin = ((s as i32 - (M as i32) / 2) * STRIDE).rem_euclid(SPS_FFT as i32) as usize;
+            let bin = Self::bin_of(s as u16).rem_euclid(SPS_FFT as i32) as usize;
             let e = buf[bin].norm_sqr();
             sum += e;
             if e > best {
@@ -127,22 +116,32 @@ impl Modem for MfskModem {
         let len_syms = bytes_to_symbols(&len.to_be_bytes(), BITS);
         let body = bytes_to_symbols(frame_bytes, BITS);
 
-        let mut bb: Vec<Complex32> = Vec::with_capacity((self.header_slots() + body.len()) * SYM);
-        for _ in 0..PREAMBLE {
-            bb.extend_from_slice(&self.tones[PILOT_SYM as usize]);
-        }
-        bb.extend_from_slice(&self.tones[SYNC_SYM as usize]);
+        // Последовательность символов: преамбула pilot × PREAMBLE, sync, длина × LEN_REPS, тело.
+        let mut syms: Vec<u16> = Vec::with_capacity(self.header_slots() + body.len());
+        syms.extend(std::iter::repeat(PILOT_SYM).take(PREAMBLE));
+        syms.push(SYNC_SYM);
         for _ in 0..LEN_REPS {
-            for &s in &len_syms {
-                bb.extend_from_slice(&self.tones[s as usize]);
-            }
+            syms.extend_from_slice(&len_syms);
         }
-        for &s in &body {
-            bb.extend_from_slice(&self.tones[s as usize]);
+        syms.extend_from_slice(&body);
+
+        // CPFSK: НЕПРЕРЫВНАЯ фаза через все символы. Иначе каждый тон стартовал с фазы 0 и
+        // на стыке частот получался скачок → щелчок в динамике на каждом символе (~50/с),
+        // который вдобавок размазывал спектр и мешал приёму. Демод (пик |FFT|) не зависит
+        // от абсолютной фазы, поэтому непрерывность фазы ему безразлична.
+        let mut bb: Vec<Complex32> = Vec::with_capacity(syms.len() * SYM);
+        let mut phase = 0.0f64;
+        for &s in &syms {
+            let dphase = 2.0 * std::f64::consts::PI * Self::bin_of(s) as f64 / SPS_FFT as f64;
+            for _ in 0..SYM {
+                bb.push(Complex32::new(phase.cos() as f32, phase.sin() as f32));
+                phase += dphase;
+            }
         }
 
         let mut passband = upconvert(&bb, self.sample_rate, self.center_hz, 0);
-        edge_ramp(&mut passband, (self.sample_rate * 0.0015) as usize);
+        super::normalize_peak(&mut passband, super::TX_PEAK);
+        edge_ramp(&mut passband, (self.sample_rate * 0.003) as usize);
         passband
     }
 

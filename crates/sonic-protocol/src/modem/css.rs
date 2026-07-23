@@ -221,23 +221,37 @@ impl Modem for CssModem {
         let total = self.header_slots() + body.len();
         let mut bb: Vec<Complex32> = Vec::with_capacity(total * self.sps);
 
+        // Каждый символ дописываем с ФАЗОВЫМ ВЫРАВНИВАНИЕМ к предыдущему: иначе на стыке
+        // символов (у каждого своя стартовая фаза чирпа) фаза скакала → щелчок в динамике
+        // на каждом символе, плюс спектральный всплеск, мешавший приёму. Поворот на
+        // постоянную фазу не двигает пик дечирпа (демод работает по |FFT|²), поэтому это
+        // безопасно для декодирования. Преамбула (повторы base_up) и так непрерывна.
         for _ in 0..PREAMBLE_UP {
-            bb.extend_from_slice(&self.base_up);
+            push_aligned(&self.base_up, &mut bb);
         }
         for _ in 0..PREAMBLE_DOWN {
-            bb.extend_from_slice(&self.base_up_conj); // down-chirp = conj(up-chirp)
+            push_aligned(&self.base_up_conj, &mut bb); // down-chirp = conj(up-chirp)
         }
-        self.symbol_chirp(MAGIC_SYNC, &mut bb);
+        let mut scratch = Vec::with_capacity(self.sps);
+        let mut emit = |s: u16, bb: &mut Vec<Complex32>| {
+            scratch.clear();
+            self.symbol_chirp(s, &mut scratch);
+            push_aligned(&scratch, bb);
+        };
+        emit(MAGIC_SYNC, &mut bb);
         for _ in 0..LEN_REPS {
             for &s in &len_syms {
-                self.symbol_chirp(s, &mut bb);
+                emit(s, &mut bb);
             }
         }
         for &s in &body {
-            self.symbol_chirp(s, &mut bb);
+            emit(s, &mut bb);
         }
 
         let mut passband = upconvert(&bb, self.sample_rate, self.center_hz, 0);
+        // Запас до полной шкалы: на пике ~1.0 реальные динамики клиппят/искажают чирп —
+        // по воздуху он рассыпался, хотя в симуляции всё идеально. Демод инвариантен к масштабу.
+        super::normalize_peak(&mut passband, super::TX_PEAK);
         apply_edge_ramp(&mut passband, (self.sample_rate * 0.003) as usize);
         passband
     }
@@ -437,6 +451,35 @@ fn coarse_frame_edge(bb: &[Complex32], sps: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Дописывает символ `raw` в `bb`, повернув его на постоянную фазу так, чтобы фаза (и
+/// мгновенная частота) на стыке с хвостом `bb` были непрерывны — убирает щелчок на
+/// границе символов. Все сэмплы имеют единичный модуль (постоянная огибающая CSS),
+/// поэтому выравнивание — это чистый фазовый поворот, не влияющий на дечирп.
+fn push_aligned(raw: &[Complex32], bb: &mut Vec<Complex32>) {
+    if raw.is_empty() {
+        return;
+    }
+    let rot = if bb.len() >= 2 {
+        let last = bb[bb.len() - 1];
+        let last2 = bb[bb.len() - 2];
+        // Ожидаемая следующая точка = продолжение фазы с той же мгновенной частотой:
+        // phase = 2·arg(last) − arg(last2). Для единичных модулей это last²·conj(last2).
+        let target = last * last * last2.conj();
+        let tn = target.norm();
+        let r0 = raw[0].norm();
+        if tn > 1e-9 && r0 > 1e-9 {
+            (target / tn) * (raw[0].conj() / r0)
+        } else {
+            Complex32::new(1.0, 0.0)
+        }
+    } else {
+        Complex32::new(1.0, 0.0)
+    };
+    for &c in raw {
+        bb.push(c * rot);
+    }
 }
 
 /// Мягкий фронт/срез (raised-cosine) на краях, чтобы динамик не щёлкал.

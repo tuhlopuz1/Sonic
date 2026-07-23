@@ -216,6 +216,23 @@ fn modes_do_not_cross_decode_each_other() {
 }
 
 #[test]
+fn tx_signals_are_click_free_with_headroom() {
+    // Щелчки в динамике = разрывы сигнала (скачки фазы/амплитуды на стыках символов) и
+    // клиппинг у полной шкалы. Оба рассыпали приём по воздуху при зелёной симуляции.
+    // Проверяем: (1) пик с запасом до 1.0 (нет клиппинга), (2) максимальный скачок между
+    // соседними сэмплами мал — у гладкого полосового сигнала он равен вкладу самой
+    // высокой частоты (~0.65), а разрыв-щелчок подбросил бы его к ~2·пик.
+    for mode in ALL {
+        let tx = build(mode).modulate(&frame_of(mode, b"click and headroom check payload"));
+        let peak = tx.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
+        assert!(peak <= 0.72, "{mode:?}: пик {peak} без запаса до клиппинга");
+        assert!(peak >= 0.5, "{mode:?}: пик {peak} — сигнал неоправданно тихий");
+        let max_step = tx.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(max_step < 0.9, "{mode:?}: скачок {max_step} — вероятен щелчок (разрыв)");
+    }
+}
+
+#[test]
 fn no_mode_false_locks_on_pure_noise() {
     // Пониженные пороги детекции не должны ловить кадр из чистого шума ни в одном режиме.
     for mode in ALL {
