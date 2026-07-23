@@ -9,10 +9,12 @@
 
 pub mod awgn;
 pub mod clock_drift;
+pub mod hardware;
 pub mod multipath;
 
 pub use awgn::AwgnChannel;
 pub use clock_drift::resample_ppm;
+pub use hardware::{DeviceResponse, OverTheAir};
 pub use multipath::MultipathChannel;
 
 /// Детерминированный ГПСЧ (xorshift64*) — без внешних крейтов, чтобы тесты были

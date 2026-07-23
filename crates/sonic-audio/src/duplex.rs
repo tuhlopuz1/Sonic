@@ -17,11 +17,11 @@ use crate::resample::Resampler;
 use crate::streams::{build_input_stream, build_output_stream};
 use cpal::traits::StreamTrait;
 use crossbeam_channel::{Receiver, Sender};
-use sonic_protocol::bandplan::{DuplexScheme, Fdd, Profile, Role};
+use sonic_protocol::bandplan::{DuplexScheme, Profile, Role, Tdd};
 use sonic_protocol::framing::PhyMode;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -95,7 +95,7 @@ fn run_engine(
     evt_tx: Sender<RxEvent>,
     init_tx: mpsc::Sender<Result<u32, String>>,
 ) {
-    let scheme = Fdd::new(cfg.role, cfg.profile);
+    let scheme = Tdd::new(cfg.role, cfg.profile);
     // Каноническая частота протокола — на ней работают все модемы, независимо от железа.
     let dsp_rate = scheme.sample_rate();
 
@@ -162,6 +162,15 @@ fn run_engine(
 
     let _ = init_tx.send(Ok(dsp_rate));
 
+    // Полудуплекс (TDD): пока мы передаём, микрофон слышит в основном СВОЙ сигнал, поэтому
+    // приём на это время глушится (иначе демодулятор давился бы собственным эхом, а буфер
+    // забивался бы им к моменту ответа пира). `tx_busy_until` — момент, когда доиграет всё
+    // поставленное в очередь аудио (по суммарной длительности, независимо от буферизации
+    // колец); плюс хвост на реверберацию/задержку тракта. `TX_TAIL` — этот хвост.
+    const TX_TAIL: Duration = Duration::from_millis(220);
+    let mut tx_busy_until = Instant::now();
+    let mut was_gated = false;
+
     let mut raw = Vec::with_capacity(8192);
     let mut resampled = Vec::with_capacity(8192);
     loop {
@@ -179,26 +188,43 @@ fn run_engine(
                 } else {
                     Resampler::new(dsp_rate, out_rate).process_all(&samples)
                 };
+                // Продлеваем окно передачи на длительность этого кадра (от текущего конца
+                // очереди или от «сейчас», если очередь уже отыграла).
+                let dur = Duration::from_secs_f64(played.len() as f64 / out_rate.max(1) as f64);
+                tx_busy_until = tx_busy_until.max(Instant::now()) + dur;
                 tx_pending.extend(played);
             }
             Err(crossbeam_channel::TryRecvError::Empty) => {}
         }
 
-        // 2. Захваченные сэмплы → каноническая частота → приёмный конвейер.
+        // 2. Захваченные сэмплы → каноническая частота. Кольцо микрофона осушаем ВСЕГДА
+        //    (иначе переполнится), но во время своей передачи вход в демодулятор не подаём.
+        let tx_active = Instant::now() < tx_busy_until + TX_TAIL;
         raw.clear();
         while let Ok(s) = mic_cons.pop() {
             raw.push(s);
         }
         if !raw.is_empty() {
             resampled.clear();
-            in_resampler.process(&raw, &mut resampled);
-            rx.push_captured(&resampled);
+            in_resampler.process(&raw, &mut resampled); // ресемплер крутим всегда — не рвём фазу
+            if !tx_active {
+                // Переход «передача → приём»: один раз чистим буфер от остатков эха.
+                if was_gated {
+                    rx.clear();
+                    was_gated = false;
+                }
+                rx.push_captured(&resampled);
+            } else {
+                was_gated = true;
+            }
         }
 
-        // 3. Демодуляция → события наверх.
-        for ev in rx.poll() {
-            if evt_tx.send(ev).is_err() {
-                break;
+        // 3. Демодуляция → события наверх (во время своей передачи не демодулируем).
+        if !tx_active {
+            for ev in rx.poll() {
+                if evt_tx.send(ev).is_err() {
+                    break;
+                }
             }
         }
 

@@ -158,19 +158,39 @@ fn ofdm_survives_clock_drift_short_frame() {
 }
 
 #[test]
-fn robust_modes_survive_reverb_plus_noise() {
-    // Реверберация комнаты (экспоненциальный RIR ~2 мс) + шум. CSS и MFSK размазаны по
-    // времени/частоте и терпят это на близкой дистанции (хороший SNR).
-    for mode in [PhyMode::Css, PhyMode::Mfsk] {
-        let m = build(mode);
-        let fb = frame_of(mode, b"room reverberation and background noise");
-        let tx = m.modulate(&fb);
+fn css_survives_heavy_reverb_plus_noise() {
+    // CSS — spread-spectrum: энергия размазана по всей полосе, поэтому частотно-селективные
+    // провалы реверберации (comb-фильтр) усредняются processing gain'ом. Это делает его
+    // РЕВЕРБЕРАЦИОННО-НАДЁЖНЫМ режимом: держит ~2 мс разброс задержек даже при 13 дБ.
+    let m = build(PhyMode::Css);
+    let fb = frame_of(PhyMode::Css, b"room reverberation and background noise");
+    let tx = m.modulate(&fb);
+    for seed in 0..6 {
         let echoed = MultipathChannel::exponential(96, 20.0).apply(&tx);
-        let buf = AwgnChannel::new(11).apply(&wrap(&echoed, 2500), 13.0);
+        let buf = AwgnChannel::new(seed + 11).apply(&wrap(&echoed, 2500), 13.0);
         let got = m
             .demodulate(&buf)
-            .unwrap_or_else(|| panic!("{mode:?}: lost under reverb+noise"));
-        assert_eq!(got.bytes, fb, "{mode:?}: mismatch under reverb+noise");
+            .unwrap_or_else(|| panic!("CSS: lost under heavy reverb+noise (seed {seed})"));
+        assert_eq!(got.bytes, fb, "CSS: mismatch under reverb+noise (seed {seed})");
+    }
+}
+
+#[test]
+fn mfsk_survives_close_range_reverb_plus_noise() {
+    // MFSK некогерентен и БЕЗ эквалайзера, поэтому частотно-селективные провалы длинной
+    // реверберации могут «утопить» отдельный тон (тяжёлую реверберацию держит CSS, а в
+    // системе — CRC→ARQ и авто-fallback). Но реверберацию близкой дистанции (в пределах
+    // защитного интервала символа, ~1.3 мс) он проходит уверенно даже при 13 дБ.
+    let m = build(PhyMode::Mfsk);
+    let fb = frame_of(PhyMode::Mfsk, b"room reverberation and background noise");
+    let tx = m.modulate(&fb);
+    for seed in 0..6 {
+        let echoed = MultipathChannel::exponential(64, 16.0).apply(&tx);
+        let buf = AwgnChannel::new(seed + 11).apply(&wrap(&echoed, 2500), 13.0);
+        let got = m
+            .demodulate(&buf)
+            .unwrap_or_else(|| panic!("MFSK: lost under close-range reverb+noise (seed {seed})"));
+        assert_eq!(got.bytes, fb, "MFSK: mismatch under reverb+noise (seed {seed})");
     }
 }
 

@@ -27,7 +27,7 @@ pub mod sim;
 pub mod telemetry;
 
 pub use arq::{ArqConfig, ArqReceiver, ArqSender, AutoFallback};
-pub use bandplan::{DuplexScheme, EchoCanceller, Fdd, NoopEchoCanceller, Profile, Role, SubBand};
+pub use bandplan::{DuplexScheme, EchoCanceller, Fdd, NoopEchoCanceller, Profile, Role, SubBand, Tdd};
 pub use framing::{Frame, FrameHeader, FramingError, PhyMode};
 pub use modem::{CssModem, Modem, ModemState, OfdmModem};
 pub use telemetry::LinkQuality;

@@ -84,6 +84,16 @@ impl RxDemodulator {
         }
     }
 
+    /// Сбрасывает накопленный приёмный буфер и reference. Вызывается в полудуплексе при
+    /// переходе «передача → приём»: за время своей передачи микрофон писал собственное эхо,
+    /// и его остатки нельзя скармливать демодулятору — иначе они «съедят» начало ответа пира.
+    /// Адаптивный шумовой пол намеренно СОХРАНЯЕТСЯ (это долгоживущая оценка среды).
+    pub fn clear(&mut self) {
+        self.buf.clear();
+        self.reference.clear();
+        self.since_attempt = 0;
+    }
+
     /// Кладёт воспроизводимые сэмплы в reference-кольцо (для AEC-шва).
     pub fn push_reference(&mut self, played: &[f32]) {
         for &s in played {
@@ -249,14 +259,14 @@ impl Transmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sonic_protocol::bandplan::{Fdd, Profile, Role};
+    use sonic_protocol::bandplan::{Profile, Role, Tdd};
     use sonic_protocol::framing::{Frame, FrameHeader, FrameType};
 
-    /// Приёмник видит две разные роли: TX одной стороны = RX другой.
-    fn peer_schemes() -> (Fdd, Fdd) {
+    /// Полудуплекс: обе стороны в одной общей полосе, различаются лишь ролью/направлением.
+    fn peer_schemes() -> (Tdd, Tdd) {
         (
-            Fdd::new(Role::Initiator, Profile::Audible),
-            Fdd::new(Role::Responder, Profile::Audible),
+            Tdd::new(Role::Initiator, Profile::Audible),
+            Tdd::new(Role::Responder, Profile::Audible),
         )
     }
 

@@ -70,11 +70,19 @@ pub struct CssModem {
 impl CssModem {
     pub fn new(band: SubBand, sample_rate: u32, params: CssParams) -> Self {
         let sf = params.sf;
-        let bw = params.bandwidth_hz.min(band.bandwidth_hz * 0.98);
         let sr = sample_rate as f32;
         let n_sym = 1usize << sf;
-        // sps = fs·2^SF/BW → дечирпнутый тон символа s попадает в бин s.
-        let sps = ((sr * n_sym as f32) / bw).round() as usize;
+        // КЛЮЧЕВОЙ инвариант CSS: дечирпнутый тон символа s попадает РОВНО в бин s только
+        // если sps = fs·2^SF/BW — ЦЕЛОЕ, т.е. fs/BW целое (иначе округление sps смещает
+        // пик и декод рассыпается). Поэтому BW выбираем не произвольным клиппингом под
+        // полосу, а как fs/OSF при ЦЕЛОМ OSF = oversampling factor: тогда sps = OSF·2^SF
+        // ровно. OSF — наименьшее целое, при котором BW = fs/OSF влезает и в под-полосу, и в
+        // потолок params.bandwidth_hz. (В прежней широкой полосе это давало ровно OSF=8,
+        // BW=6000 — поведение не изменилось; в узкой TDD-полосе — OSF=16, BW=3000.)
+        let max_bw = (band.bandwidth_hz * 0.98).min(params.bandwidth_hz);
+        let osf = (sr / max_bw).ceil().max(1.0) as usize;
+        let bw = sr / osf as f32;
+        let sps = osf * n_sym;
 
         // Базовый up-chirp в baseband: мгновенная частота линейно от −BW/2 до +BW/2.
         // Фаза (замкнутая форма интеграла): φ(n) = π·BW/fs · (n²/sps − n).

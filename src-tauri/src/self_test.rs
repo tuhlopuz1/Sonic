@@ -15,7 +15,7 @@ use sonic_audio::streams::{build_input_stream, build_output_stream};
 use sonic_protocol::bandplan::Profile;
 use sonic_protocol::framing::{Frame, FrameHeader, FrameType, PhyMode};
 use sonic_protocol::modem::qam::Modulation;
-use sonic_protocol::modem::{CssModem, MfskModem, Modem, OfdmModem};
+use sonic_protocol::modem::{CssModem, Demodulated, MfskModem, Modem, OfdmModem};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -58,8 +58,9 @@ pub fn run(mode: PhyMode, selection: &AudioSelection) -> Result<SelfTestReport, 
     let out_rate = out_config.sample_rate().0;
     let in_rate = in_config.sample_rate().0;
 
-    // Нижняя полоса профиля — TX и RX в ней же (само-приём).
-    let band = Profile::Audible.band_plan().lower;
+    // Общая полудуплексная полоса профиля — ровно та же, в которой работает реальная связь,
+    // поэтому самотест проверяет тот же тракт (а не отдельную полосу, как было раньше).
+    let band = Profile::Audible.band_plan().data;
     let modem = build_modem(mode, band);
 
     // Тестовый кадр. Payload короткий: у медленных режимов (CSS/MFSK) длина кадра прямо
@@ -118,7 +119,7 @@ pub fn run(mode: PhyMode, selection: &AudioSelection) -> Result<SelfTestReport, 
     } else {
         Resampler::new(in_rate, DSP_RATE).process_all(&captured)
     };
-    let demod = modem.demodulate(&cap48);
+    let demod = robust_demodulate(modem.as_ref(), &cap48, DSP_RATE);
 
     let (detected, matched, snr_db) = match &demod {
         Some(d) => (true, d.bytes == frame_bytes, d.snr_db),
@@ -141,13 +142,39 @@ pub fn run(mode: PhyMode, selection: &AudioSelection) -> Result<SelfTestReport, 
     })
 }
 
+/// Демодуляция, устойчивая к мусорному старту записи. При старте потоков динамик нередко
+/// «щёлкает», а AGC микрофона разгоняется — этот транзиент даёт ложный энергетический фронт,
+/// на который демодулятор синхронизируется ОДИН раз и проваливается (отсюда «самотест проходит
+/// через раз»). Здесь: сначала пробуем весь буфер, а при неудаче сдвигаем старт вперёд шагами
+/// и пробуем снова — один ложный фронт в начале записи больше не рушит весь тест.
+fn robust_demodulate(modem: &dyn Modem, cap: &[f32], rate: u32) -> Option<Demodulated> {
+    if let Some(d) = modem.demodulate(cap) {
+        return Some(d);
+    }
+    let step = (rate as usize / 10).max(1); // 100 мс
+    let max_start = (rate as usize).min(cap.len()); // до ~1 c от начала записи
+    let mut start = step;
+    while start < max_start {
+        if let Some(mut d) = modem.demodulate(&cap[start..]) {
+            d.start_sample += start;
+            d.end_sample += start;
+            return Some(d);
+        }
+        start += step;
+    }
+    None
+}
+
 fn verdict(detected: bool, matched: bool, peak: f32, snr_db: f32) -> String {
     if matched {
         return format!("✓ Модем работает через реальный звук (SNR ~{snr_db:.0} дБ).");
     }
     if peak < 0.01 {
-        return "Микрофон почти не слышит сигнал. Прибавьте громкость динамика, \
-                выберите правильные устройства и не заглушайте микрофон."
+        return "Микрофон почти не слышит сигнал. Прибавьте громкость динамика и выберите \
+                правильные устройства. На телефоне это часто системное эхоподавление: ОС \
+                вырезает из микрофона собственное воспроизведение, поэтому loopback-самотест \
+                на одном устройстве может не пройти. Связь МЕЖДУ двумя устройствами это НЕ \
+                ломает — проверьте передачу с другим телефоном рядом."
             .into();
     }
     if detected {

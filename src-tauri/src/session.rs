@@ -18,7 +18,7 @@ use crate::events;
 use serde::Serialize;
 use sonic_audio::{DuplexEngine, EngineConfig, RxEvent};
 use sonic_protocol::arq::{ArqConfig, ArqReceiver, ArqSender, AutoFallback};
-use sonic_protocol::bandplan::{DuplexScheme, Fdd};
+use sonic_protocol::bandplan::{DuplexScheme, Tdd};
 use sonic_protocol::fec::FecCodec;
 use sonic_protocol::framing::{Frame, FrameHeader, FrameType, PhyMode};
 use sonic_protocol::modem::qam::Modulation;
@@ -42,7 +42,7 @@ const FEC_NSYM: usize = 16;
 /// Сколько миллисекунд ОДИН кадр данных этого режима реально звучит в эфире (для
 /// airtime-осознанного ARQ-таймаута). Считаем по фактическим параметрам модема, поэтому
 /// оценка остаётся верной, если параметры поменяются.
-fn frame_airtime_ms(scheme: &Fdd, mode: PhyMode, payload_len: usize) -> f32 {
+fn frame_airtime_ms(scheme: &Tdd, mode: PhyMode, payload_len: usize) -> f32 {
     let band = scheme.tx_band();
     let sr = scheme.sample_rate();
     let samples = match mode {
@@ -52,6 +52,19 @@ fn frame_airtime_ms(scheme: &Fdd, mode: PhyMode, payload_len: usize) -> f32 {
         PhyMode::Ofdm16Qam => OfdmModem::new(band, sr, Modulation::Qam16).frame_samples(payload_len),
     };
     samples as f32 * 1000.0 / sr as f32
+}
+
+/// Конфиг ARQ с ролевым «стаггером» таймаута: у респондера таймаут ретрансмиссии на 25 %
+/// длиннее, чем у инициатора. В полудуплексе это разводит их ретрансмиссии по времени —
+/// иначе при (редком) одновременном старте передачи обе стороны били бы ретрансмиты в
+/// лок-степе (backoff одинаковый), и коллизия могла бы самоповторяться. Разная база таймаута
+/// у A и B гарантированно ломает симметрию.
+fn arq_config(role: Role, mode: PhyMode, rtt_ms: f32, airtime_ms: f32) -> ArqConfig {
+    let mut cfg = ArqConfig::for_mode(mode, rtt_ms, airtime_ms);
+    if role == Role::Responder {
+        cfg.timeout_ms += cfg.timeout_ms / 4;
+    }
+    cfg
 }
 
 /// Политика выбора режима из UI. Кроме Auto (авто-fallback по лестнице) — явный выбор
@@ -181,7 +194,7 @@ fn session_loop(
 ) {
     let fec = FecCodec::new(FEC_K, FEC_NSYM);
     let my_dir = role.direction_bit();
-    let scheme = Fdd::new(role, profile);
+    let scheme = Tdd::new(role, profile);
     // Репрезентативный размер кадра данных (FEC-байт на полный чанк) для оценки airtime.
     let rep_payload = fec.encoded_len(4 + CHUNK_LEN);
     let airtime = move |mode| frame_airtime_ms(&scheme, mode, rep_payload);
@@ -191,7 +204,7 @@ fn session_loop(
     let mut policy = ModePolicy::Auto;
 
     let start_mode = current_mode(policy, &fb);
-    let mut arq_tx = ArqSender::new(ArqConfig::for_mode(start_mode, 500.0, airtime(start_mode)));
+    let mut arq_tx = ArqSender::new(arq_config(role, start_mode, 500.0, airtime(start_mode)));
     let mut arq_rx: ArqReceiver<Vec<u8>> = ArqReceiver::new();
 
     // seq → метаданные исходящего кадра (для события "delivered" и авто-fallback).
@@ -222,7 +235,7 @@ fn session_loop(
                     fb.force(mode);
                 }
                 let m = current_mode(policy, &fb);
-                arq_tx.set_config(ArqConfig::for_mode(m, link.rtt_ms.max(500.0), airtime(m)));
+                arq_tx.set_config(arq_config(role, m, link.rtt_ms.max(500.0), airtime(m)));
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
@@ -271,7 +284,7 @@ fn session_loop(
                     let acked = before.saturating_sub(arq_tx.in_flight());
                     for _ in 0..acked {
                         if policy == ModePolicy::Auto && fb.on_success() {
-                            apply_mode_change(&mut arq_tx, &fb, &link, policy, &airtime);
+                            apply_mode_change(&mut arq_tx, &fb, &link, policy, role, &airtime);
                         }
                     }
                     // Уведомляем UI о доставке подтверждённых кадров.
@@ -300,7 +313,7 @@ fn session_loop(
                 transmit_frame(&engine, mode, FrameType::Data, my_dir, *seq, &arq_rx, payload);
             }
             if !retx.is_empty() && policy == ModePolicy::Auto && fb.on_failure() {
-                apply_mode_change(&mut arq_tx, &fb, &link, policy, &airtime);
+                apply_mode_change(&mut arq_tx, &fb, &link, policy, role, &airtime);
             }
             if arq_tx.link_down() {
                 let _ = app.emit(events::SESSION_STATE_CHANGED, SessionStateEvent { state: "down" });
@@ -332,10 +345,11 @@ fn apply_mode_change(
     fb: &AutoFallback,
     link: &LinkQuality,
     policy: ModePolicy,
+    role: Role,
     airtime: &impl Fn(PhyMode) -> f32,
 ) {
     let m = current_mode(policy, fb);
-    arq_tx.set_config(ArqConfig::for_mode(m, link.rtt_ms.max(500.0), airtime(m)));
+    arq_tx.set_config(arq_config(role, m, link.rtt_ms.max(500.0), airtime(m)));
 }
 
 /// Режет текст на чанки, кладёт под FEC, ставит в очередь отправки.

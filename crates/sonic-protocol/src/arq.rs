@@ -19,28 +19,27 @@ pub struct ArqConfig {
 }
 
 impl ArqConfig {
-    /// Окно и таймаут под режим (PROTOCOL.md §7.3). Окно: OFDM быстрый (32), MFSK (8),
-    /// CSS медленный (4).
+    /// Окно и таймаут под режим.
     ///
-    /// `frame_airtime_ms` — сколько времени ОДИН кадр данных реально звучит в эфире в
-    /// этом режиме. Это критично: у медленных режимов кадр длится секунды (CSS ~3–5 с),
-    /// и фиксированный таймаут 300 мс приводил к тому, что отправитель считал кадр
-    /// потерянным ещё до конца его проигрывания — заваливал очередь ретрансмиссиями и
-    /// ложно объявлял LINK_DOWN, из-за чего связь по CSS «вообще не работала». Берём
-    /// максимум из 3·RTT и (передать кадр + принять ACK + запас).
-    pub fn for_mode(mode: PhyMode, rtt_ms: f32, frame_airtime_ms: f32) -> Self {
-        let window = match mode {
-            PhyMode::OfdmQpsk | PhyMode::Ofdm16Qam => 32,
-            PhyMode::Mfsk => 8,
-            PhyMode::Css => 4,
-        };
+    /// **Окно = 1 (stop-and-wait) — это требование ПОЛУДУПЛЕКСА.** Связь идёт в ОДНОЙ общей
+    /// полосе (TDD, см. `bandplan`): передавать и принимать одновременно нельзя. Если бы
+    /// отправитель слал несколько кадров подряд (окно >1), то ACK пира на первый кадр
+    /// столкнулся бы в эфире со вторым кадром отправителя — оба бы пропали, начались бы
+    /// ложные ретрансмиссии и разрывы. При окне 1 передачи строго чередуются: кадр → тишина →
+    /// ACK → тишина → следующий кадр. Медленнее по пиковой скорости, но НАДЁЖНО на любом
+    /// железе (а для мессенджера надёжность важнее throughput).
+    ///
+    /// `frame_airtime_ms` — сколько времени ОДИН кадр реально звучит в эфире. Критично для
+    /// медленных режимов (CSS — секунды): фиксированный короткий таймаут считал бы кадр
+    /// потерянным ещё до конца проигрывания. Таймаут = max(3·RTT, передать кадр + ACK + запас).
+    pub fn for_mode(_mode: PhyMode, rtt_ms: f32, frame_airtime_ms: f32) -> Self {
         // 2·airtime покрывает и передачу кадра, и обратный ACK (ACK короче, но с запасом).
-        let airtime_floor = (2.0 * frame_airtime_ms + 600.0) as u64;
-        let timeout_ms = ((3.0 * rtt_ms) as u64).max(airtime_floor).max(300);
+        let airtime_floor = (2.0 * frame_airtime_ms + 800.0) as u64;
+        let timeout_ms = ((3.0 * rtt_ms) as u64).max(airtime_floor).max(400);
         ArqConfig {
-            window,
+            window: 1, // полудуплекс: строго stop-and-wait (см. выше)
             timeout_ms,
-            max_retries: 8, // после 8 неудач подряд — LINK_DOWN (§7.3)
+            max_retries: 10, // после 10 неудач подряд — LINK_DOWN
         }
     }
 }
@@ -246,14 +245,13 @@ pub struct AutoFallback {
 impl AutoFallback {
     pub fn new() -> Self {
         AutoFallback {
-            ladder: vec![
-                PhyMode::Ofdm16Qam,
-                PhyMode::OfdmQpsk,
-                PhyMode::Mfsk,
-                PhyMode::Css,
-            ],
+            // 16-QAM НАМЕРЕННО вне авто-лестницы: на реальном железе он рассыпается даже в
+            // своей полосе (нелинейность динамика на амплитудном созвездии — см. тест
+            // hardware_link). Auto держится надёжной тройки QPSK→MFSK→CSS. 16-QAM остаётся
+            // доступен ручным выбором (Force) для экспериментов на хорошем тракте.
+            ladder: vec![PhyMode::OfdmQpsk, PhyMode::Mfsk, PhyMode::Css],
             // Стартуем с CSS: сессия начинается в самом надёжном режиме (PROTOCOL.md §9).
-            level: 3,
+            level: 2,
             consecutive_failures: 0,
             consecutive_successes: 0,
             fail_threshold: 3,    // 3 неподтверждённых кадра подряд → вниз (§9)
@@ -414,15 +412,10 @@ mod tests {
     fn auto_fallback_degrades_and_recovers() {
         let mut fb = AutoFallback::new();
         assert_eq!(fb.current(), PhyMode::Css); // старт в CSS
-        fb.force(PhyMode::Ofdm16Qam);
-        assert_eq!(fb.current(), PhyMode::Ofdm16Qam);
-
-        // 3 неудачи подряд → спуск на ступень (QPSK).
-        fb.on_failure();
-        fb.on_failure();
-        assert!(fb.on_failure());
+        fb.force(PhyMode::OfdmQpsk); // вершина авто-лестницы (16-QAM вне авто)
         assert_eq!(fb.current(), PhyMode::OfdmQpsk);
-        // ещё серия → MFSK.
+
+        // 3 неудачи подряд → спуск на ступень (MFSK).
         fb.on_failure();
         fb.on_failure();
         assert!(fb.on_failure());
@@ -439,5 +432,14 @@ mod tests {
         }
         assert!(fb.on_success());
         assert_eq!(fb.current(), PhyMode::Mfsk);
+    }
+
+    #[test]
+    fn for_mode_is_stop_and_wait_for_half_duplex() {
+        // Полудуплекс требует окна 1 во всех режимах (иначе ACK пира сталкивается со
+        // следующим кадром отправителя в общей полосе).
+        for mode in [PhyMode::Css, PhyMode::Mfsk, PhyMode::OfdmQpsk, PhyMode::Ofdm16Qam] {
+            assert_eq!(ArqConfig::for_mode(mode, 500.0, 200.0).window, 1, "{mode:?}");
+        }
     }
 }
