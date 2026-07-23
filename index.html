@@ -26,25 +26,17 @@
         </header>
 
         <div class="chats-scroll">
-          <section class="chats-section">
-            <div class="section-head">
-              <span class="section-title">Чаты поблизости</span>
-              <button id="discover-btn" type="button" class="icon-btn" title="Искать снова">
-                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6"/></svg>
-              </button>
-            </div>
-            <p id="discovery-status" class="section-status"></p>
-            <ul id="discovery-list" class="chat-list">
-              <li class="chat-empty" id="discovery-empty">
-                <span class="chat-empty-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
-                Слушаю эфир — устройства появятся, как только откликнутся звуком.
-              </li>
-            </ul>
-          </section>
-
           <!-- Настройка сессии (до подключения) -->
           <section id="setup" class="setup-section">
             <span class="section-title">Новая сессия</span>
+
+            <button id="start-btn" class="primary block start-cta">
+              <span class="start-cta-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 9-14 9V3z"/></svg>
+              </span>
+              Запустить сессию
+            </button>
+            <p id="setup-error" class="error"></p>
 
             <div class="field">
               <label>Роль</label>
@@ -74,8 +66,22 @@
             </div>
 
             <button id="refresh-devices" type="button" class="link-btn">↻ Обновить список устройств</button>
-            <button id="start-btn" class="primary block">Запустить сессию</button>
-            <p id="setup-error" class="error"></p>
+          </section>
+
+          <section class="chats-section">
+            <div class="section-head">
+              <span class="section-title">Чаты поблизости</span>
+              <button id="discover-btn" type="button" class="icon-btn" title="Искать снова">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6"/></svg>
+              </button>
+            </div>
+            <p id="discovery-status" class="section-status"></p>
+            <ul id="discovery-list" class="chat-list">
+              <li class="chat-empty" id="discovery-empty">
+                <span class="chat-empty-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+                Слушаю эфир — устройства появятся, как только откликнутся звуком.
+              </li>
+            </ul>
           </section>
         </div>
       </aside>
@@ -125,9 +131,13 @@
       <aside class="status-pane">
         <section id="mascot-card" class="mascot-card mood-sad">
           <div class="mascot-screen">
+            <div class="mascot-ripple" aria-hidden="true"><span></span><span></span><span></span></div>
+            <div class="mascot-burst" aria-hidden="true"></div>
             <div id="mascot-avatar" class="mascot-avatar mascot-avatar-lg mood-sad" aria-hidden="true">
               <div class="mascot-face face-default"></div>
-              <div class="mascot-face face-jump"></div>
+              <div class="mascot-face face-jump1"></div>
+              <div class="mascot-face face-jump2"></div>
+              <div class="mascot-face face-jump3"></div>
               <div class="mascot-face face-angry"></div>
               <div class="mascot-face face-sad"></div>
               <div class="mascot-face face-happy1"></div>

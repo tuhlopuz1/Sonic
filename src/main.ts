@@ -92,6 +92,53 @@ function setMascotMood(mood: Mood, revertMs?: number) {
   }
 }
 
+// Короткая реакция экрана маскота (вздрагивание) — например, на входящее сообщение.
+// Не трогает mood/лицо, только даёт ощущение «живого» отклика.
+function pingMascot() {
+  const screen = document.querySelector<HTMLElement>(".mascot-screen");
+  if (!screen) return;
+  screen.classList.remove("ping");
+  void screen.offsetWidth;
+  screen.classList.add("ping");
+}
+
+// Реакция на отправку: импульс-кольцо от Соника + короткий разгон эквалайзера.
+let transmitTimer: ReturnType<typeof setTimeout> | undefined;
+function transmitMascot() {
+  const card = $("#mascot-card");
+  if (!card) return;
+  card.classList.remove("sending");
+  void card.offsetWidth;
+  card.classList.add("sending");
+  if (transmitTimer) clearTimeout(transmitTimer);
+  transmitTimer = setTimeout(() => card.classList.remove("sending"), 760);
+}
+
+// Настроение маскота по качеству связи: сильный сигнал — бодрый и яркий,
+// слабый — сереет. Отражается только в спокойном idle (не перебивает jump/happy/…).
+type Signal = "good" | "mid" | "poor";
+const SIGNAL_CAPTIONS: Record<Signal, string> = {
+  good: "На связи · сигнал отличный",
+  mid: "На связи · сигнал средний",
+  poor: "На связи · сигнал слабый",
+};
+function signalLevel(snr: number): Signal {
+  if (snr >= 12) return "good";
+  if (snr >= 5) return "mid";
+  return "poor";
+}
+function updateSignalMood(snr: number) {
+  const card = $("#mascot-card");
+  if (!card) return;
+  const level = signalLevel(snr);
+  // dataset переживает сброс className в setMascotMood — поэтому храним качество здесь.
+  card.dataset.q = level;
+  if (sessionUp && card.classList.contains("mood-idle")) {
+    const caption = $("#mascot-status");
+    if (caption) caption.textContent = SIGNAL_CAPTIONS[level];
+  }
+}
+
 // ── Переключатели (segmented controls) ──────────────────────────────────────
 
 function wireSegmented(containerSel: string, onPick: (value: string) => void) {
@@ -298,15 +345,22 @@ function renderTelemetry(q: LinkQuality) {
     modeEl.textContent = q.mode;
     modeEl.className = `tele-value mode-badge ${modeBadgeClass(q.mode)}`;
   }
+  // Меняем текст только при реальном изменении и коротко подсвечиваем (flash),
+  // перезапуская анимацию через принудительный reflow.
   const set = (sel: string, val: string) => {
     const el = $(sel);
-    if (el) el.textContent = val;
+    if (!el || el.textContent === val) return;
+    el.textContent = val;
+    el.classList.remove("flash");
+    void el.offsetWidth;
+    el.classList.add("flash");
   };
   set("#tele-snr", `${q.snr_db.toFixed(1)} дБ`);
   set("#tele-rtt", q.rtt_ms > 0 ? `${q.rtt_ms.toFixed(0)} мс` : "— мс");
   set("#tele-retx", String(q.retransmits));
   set("#tele-per", `${(q.per * 100).toFixed(0)}%`);
   set("#tele-inflight", String(q.in_flight));
+  updateSignalMood(q.snr_db);
 }
 
 // Живая аудио-диагностика: показывает, что реально слышит микрофон, где порог детекции и
@@ -382,6 +436,7 @@ function wireMessenger() {
 
   listen<MessageReceived>("message-received", (e) => {
     appendBubble(e.payload.text, "in");
+    pingMascot();
   });
 
   listen<MessageStatus>("message-status", (e) => {
@@ -389,6 +444,7 @@ function wireMessenger() {
     if (status === "sent") {
       const bubble = appendBubble(text, "out");
       outgoing.set(msg_id, bubble);
+      transmitMascot();
     } else if (status === "delivered") {
       const bubble = outgoing.get(msg_id);
       const st = bubble?.querySelector<HTMLElement>(".bubble-status");
@@ -564,7 +620,10 @@ function renderDiscoveryList() {
 function setDiscoveryBusy(busy: boolean) {
   const btn = $<HTMLButtonElement>("#discover-btn");
   const input = $<HTMLInputElement>("#nickname-input");
-  if (btn) btn.disabled = busy;
+  if (btn) {
+    btn.disabled = busy;
+    btn.classList.toggle("spinning", busy);
+  }
   if (input) input.disabled = busy;
 }
 async function discoverDevices() {
