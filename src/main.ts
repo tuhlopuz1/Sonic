@@ -48,6 +48,38 @@ const outgoing = new Map<number, HTMLElement>();
 
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector<T>(sel);
 
+// ── Маскот: живой индикатор состояния канала ─────────────────────────────────
+// idle — слушаем фон, jump — хендшейк/подключение, angry — ошибка/сбой,
+// sad — связь потеряна, happy — сообщение доставлено (кратковременно).
+
+type Mood = "idle" | "jump" | "angry" | "sad" | "happy";
+let mascotRevertTimer: ReturnType<typeof setTimeout> | undefined;
+
+// Подпись под маскотом — словами описывает текущий статус передачи.
+const MOOD_CAPTIONS: Record<Mood, string> = {
+  idle: "На связи · слушаю эфир",
+  jump: "Устанавливаю соединение…",
+  angry: "Сбой передачи",
+  sad: "Связь потеряна",
+  happy: "Сообщение доставлено",
+};
+
+function setMascotMood(mood: Mood, revertMs?: number) {
+  const el = $("#mascot-avatar");
+  if (el) el.className = `mascot-avatar mascot-avatar-lg mood-${mood}`;
+  const card = $("#mascot-card");
+  if (card) card.className = `mascot-card mood-${mood}`;
+  const caption = $("#mascot-status");
+  if (caption) caption.textContent = MOOD_CAPTIONS[mood];
+  if (mascotRevertTimer) {
+    clearTimeout(mascotRevertTimer);
+    mascotRevertTimer = undefined;
+  }
+  if (revertMs) {
+    mascotRevertTimer = setTimeout(() => setMascotMood(sessionUp ? "idle" : "sad"), revertMs);
+  }
+}
+
 // ── Переключатели (segmented controls) ──────────────────────────────────────
 
 function wireSegmented(containerSel: string, onPick: (value: string) => void) {
@@ -143,6 +175,7 @@ async function startSession() {
   const startBtn = $<HTMLButtonElement>("#start-btn");
   if (errorEl) errorEl.textContent = "";
   if (startBtn) startBtn.disabled = true;
+  setMascotMood("jump");
   try {
     await invoke("start_session", {
       profile: selectedProfile,
@@ -153,6 +186,7 @@ async function startSession() {
   } catch (err) {
     if (errorEl) errorEl.textContent = `Ошибка запуска: ${err}`;
     if (startBtn) startBtn.disabled = false;
+    setMascotMood("angry", 2200);
   }
 }
 
@@ -178,7 +212,10 @@ function setSessionUp(up: boolean) {
   }
   setup?.classList.toggle("hidden", up);
   chat?.classList.toggle("hidden", !up);
+  $("#main-empty")?.classList.toggle("hidden", up);
+  $("#main-chat")?.classList.toggle("hidden", !up);
   if (startBtn) startBtn.disabled = false;
+  setMascotMood(up ? "idle" : "sad");
   if (up) $<HTMLInputElement>("#msg-input")?.focus();
 }
 
@@ -199,7 +236,7 @@ function appendBubble(text: string, kind: "in" | "out"): HTMLElement {
   bubble.appendChild(body);
   if (kind === "out") {
     const status = document.createElement("span");
-    status.className = "bubble-status";
+    status.className = "bubble-status mono";
     status.textContent = "отправляется…";
     bubble.appendChild(status);
   }
@@ -221,6 +258,7 @@ async function sendMessage(e: Event) {
     await invoke("send_message", { text });
   } catch (err) {
     appendBubble(`⚠ не отправлено: ${err}`, "out");
+    setMascotMood("angry", 2200);
   }
 }
 
@@ -300,6 +338,7 @@ function wireMessenger() {
         st.textContent = "✓✓ доставлено";
         st.classList.add("delivered");
       }
+      setMascotMood("happy", 1800);
     }
   });
 
@@ -314,6 +353,7 @@ function wireMessenger() {
         badge.textContent = "нет связи";
         badge.classList.add("off");
       }
+      if (sessionUp) setMascotMood("sad");
     }
   });
 }
@@ -360,6 +400,24 @@ function modeClass(mode: string): string {
       return "mode-64qam";
     default:
       return "";
+  }
+}
+/// Короткое имя режима для компактного бейджа в списке чатов.
+/// (mode_label с бэкенда — длинный, вида «CSS (Chirp Spread Spectrum) — …», в чип не влезает.)
+function shortMode(mode: string): string {
+  switch (mode) {
+    case "CSS":
+      return "CSS";
+    case "MFSK":
+      return "MFSK";
+    case "OFDM_QPSK":
+      return "QPSK";
+    case "OFDM_16QAM":
+      return "16-QAM";
+    case "OFDM_64QAM":
+      return "64-QAM";
+    default:
+      return mode;
   }
 }
 function formatBitrate(bps: number): string {
@@ -418,23 +476,31 @@ function loadOrCreateNickname(): string {
   localStorage.setItem(NICKNAME_STORAGE_KEY, generated);
   return generated;
 }
+function qualityClass(label: string): string {
+  if (label === "Отличная" || label === "Хорошая") return "quality-good";
+  if (label === "Средняя") return "quality-mid";
+  return "quality-bad";
+}
 function renderDiscoveryList() {
   const listEl = $("#discovery-list");
+  const emptyEl = $("#discovery-empty");
   if (!listEl) return;
   const devices = [...discoveredDevices.values()].sort((a, b) => b.snr_db - a.snr_db);
-  listEl.innerHTML = devices
-    .map(
-      (d) => `
-      <li class="discovery-item">
+  if (emptyEl) emptyEl.classList.toggle("hidden", devices.length > 0);
+  listEl.querySelectorAll(".discovery-item").forEach((el) => el.remove());
+  for (const d of devices) {
+    const li = document.createElement("li");
+    li.className = "discovery-item";
+    li.title = `${d.mode_label} · ${d.quality_label} · ${d.snr_db.toFixed(1)} дБ`;
+    li.innerHTML = `
+      <span class="discovery-avatar">${d.nickname.slice(0, 1).toUpperCase()}</span>
+      <span class="discovery-info">
         <span class="discovery-nickname">${d.nickname}</span>
-        <span class="discovery-snr">${d.snr_db.toFixed(1)} дБ — ${d.quality_label}</span>
-        <span class="mode-badge inline ${modeClass(d.recommended_mode)}">
-          <span class="mode-name">${d.mode_label}</span>
-          <span class="mode-rate">${formatBitrate(d.estimated_bitrate_bps)}</span>
-        </span>
-      </li>`
-    )
-    .join("");
+        <span class="discovery-snr ${qualityClass(d.quality_label)}">${d.quality_label.toLowerCase()} · ${d.snr_db.toFixed(1)} дБ</span>
+      </span>
+      <span class="mode-badge inline ${modeClass(d.recommended_mode)}">${shortMode(d.recommended_mode)}</span>`;
+    listEl.appendChild(li);
+  }
 }
 function setDiscoveryBusy(busy: boolean) {
   const btn = $<HTMLButtonElement>("#discover-btn");
@@ -550,4 +616,7 @@ function wireTools() {
 window.addEventListener("DOMContentLoaded", () => {
   wireMessenger();
   wireTools();
+  // Список "устройств поблизости" в сайдбаре пуст, пока не запущено обнаружение —
+  // включаем его сразу при старте, чтобы список начал жить сам по себе.
+  discoverDevices();
 });
