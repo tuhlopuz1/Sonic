@@ -94,7 +94,8 @@ jobs:
       - name: Create temporary release config
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-        run: node -e "require('fs').writeFileSync('tauri-release.conf.json', JSON.stringify({ version: process.env.RELEASE_VERSION }))"
+        run: |
+          node -e "require('fs').writeFileSync('tauri-release.conf.json', JSON.stringify({ version: process.env.RELEASE_VERSION }))"
 
       - name: Build app bundles
         run: npm run tauri build -- --config tauri-release.conf.json
@@ -152,7 +153,8 @@ jobs:
       - name: Create temporary release config
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-        run: node -e "require('fs').writeFileSync('tauri-release.conf.json', JSON.stringify({ version: process.env.RELEASE_VERSION }))"
+        run: |
+          node -e "require('fs').writeFileSync('tauri-release.conf.json', JSON.stringify({ version: process.env.RELEASE_VERSION }))"
 
       # Populates src-tauri/gen/android/keystore.properties (gitignored) from repo
       # secrets, which app/build.gradle.kts picks up automatically for release signing.
